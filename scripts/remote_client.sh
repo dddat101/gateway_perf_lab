@@ -299,6 +299,17 @@ cmd_run_iperf() {
         iperf_args=("-c" "${WAN_SERVER_IP:-10.10.0.1}" "-p" "5202" "-t" "5")
     fi
 
+    # Ensure remote host routes traffic for WAN server through Wi-Fi interface (DUT)
+    local env_dump
+    env_dump="$(cmd_get_wifi_env 2>/dev/null || true)"
+    eval "${env_dump}"
+    local remote_wifi_if="${REMOTE_WIFI_IF:-}"
+    local remote_gw="${REMOTE_WIFI_GATEWAY:-${DUT_LAN_IP:-192.168.1.1}}"
+    local wan_ip="${WAN_SERVER_IP:-10.10.0.1}"
+    if [[ -n "${remote_wifi_if}" && -n "${remote_gw}" ]]; then
+        remote_ssh_raw "sudo -n ip route replace '${wan_ip}' via '${remote_gw}' dev '${remote_wifi_if}' 2>/dev/null || true"
+    fi
+
     # Join arguments with spaces to prevent IFS newline splitting
     local iperf_cmd
     iperf_cmd="iperf3 $(IFS=' '; echo "${iperf_args[*]}")"
@@ -373,6 +384,14 @@ cmd_run_voip() {
     local remote_wifi_if="${REMOTE_WIFI_IF:-wlan0}"
     local remote_ssid="${REMOTE_WIFI_SSID:-none}"
     local remote_status="${REMOTE_WIFI_STATUS:-DISCONNECTED}"
+    local remote_gw="${REMOTE_WIFI_GATEWAY:-${DUT_LAN_IP:-192.168.1.1}}"
+
+    # Ensure remote host routes traffic for server_ip via Wi-Fi interface (DUT)
+    # and mark outgoing VoIP packets with DSCP 46 (EF) for 802.11 WMM Voice (AC_VO)
+    if [[ -n "${remote_wifi_if}" && -n "${remote_gw}" ]]; then
+        remote_ssh_raw "sudo -n ip route replace '${server_ip}' via '${remote_gw}' dev '${remote_wifi_if}' 2>/dev/null || true"
+        remote_ssh_raw "sudo -n iptables -t mangle -C POSTROUTING -o '${remote_wifi_if}' -p udp -m multiport --dports 5060,5062,5064,10000,10002,10004 -j DSCP --set-dscp 46 2>/dev/null || sudo -n iptables -t mangle -A POSTROUTING -o '${remote_wifi_if}' -p udp -m multiport --dports 5060,5062,5064,10000,10002,10004 -j DSCP --set-dscp 46 2>/dev/null || true"
+    fi
 
     local remote_cmd=""
     if [[ "${engine}" == "pjsua" || "${engine}" == "auto" ]]; then
@@ -418,6 +437,7 @@ cmd_run_voip() {
 
     log_info "Launching remote Phone 2 VoIP client on ${TARGET_HOST}..."
     log_info "  -> Remote Wi-Fi Link : ${remote_wifi_if} [${remote_status}] (SSID: '${remote_ssid}', IP: ${remote_wifi_ip:-unknown})"
+    log_info "  -> Remote Route      : ${server_ip} via ${remote_gw} dev ${remote_wifi_if}"
     log_info "  -> VoIP Engine       : [${engine^^}] | Server: ${server_ip}:${server_port} | RTP: ${rtp_port} | Duration: ${duration}s"
 
     local spawned_pid
@@ -448,6 +468,7 @@ cmd_clean() {
     print_header "CLEANING LINGERING PROCESSES ON REMOTE CLIENT"
     log_info "Target Endpoint: ${TARGET_USER}@${TARGET_HOST}"
 
+    local wan_ip="${WAN_SERVER_IP:-10.10.0.1}"
     local clean_script='
         for proc in iperf3 pjsua sipp; do
             pkill -TERM -x "${proc}" 2>/dev/null || true
@@ -461,6 +482,8 @@ cmd_clean() {
         done
         pkill -KILL -f "[t]raffic_generator.py" 2>/dev/null || true
         pkill -KILL -f "[v]oip_call_simulator.py" 2>/dev/null || true
+        sudo -n ip route del "'"${wan_ip}"'" 2>/dev/null || true
+        sudo -n iptables -t mangle -D POSTROUTING -p udp -m multiport --dports 5060,5062,5064,10000,10002,10004 -j DSCP --set-dscp 46 2>/dev/null || true
         echo "Remote processes cleaned."
     '
     remote_ssh_raw "${clean_script}"

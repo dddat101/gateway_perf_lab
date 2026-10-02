@@ -1315,6 +1315,11 @@ run_phase_voice_qos() {
             CLEANUP_IPTABLES_MANGLE="iptables -t mangle -D POSTROUTING -o ${DETECTED_WIFI_IF} -p udp -m multiport --dports 5060,5062,5064,10000,10002,10004 -j DSCP --set-dscp 46"
             added_mangle_rule=1
         fi
+
+        if [[ "${eff_mode}" == "distributed" && -n "${REMOTE_WIFI_IF:-}" ]]; then
+            local remote_gw="${REMOTE_WIFI_GATEWAY:-${DUT_LAN_IP:-192.168.1.1}}"
+            "${SCRIPT_DIR}/remote_client.sh" exec "sudo -n ip route replace '${WAN_SERVER_IP:-10.10.0.1}' via '${remote_gw}' dev '${REMOTE_WIFI_IF}' 2>/dev/null || true; sudo -n iptables -t mangle -C POSTROUTING -o '${REMOTE_WIFI_IF}' -p udp -m multiport --dports 5060,5062,5064,10000,10002,10004 -j DSCP --set-dscp 46 2>/dev/null || sudo -n iptables -t mangle -A POSTROUTING -o '${REMOTE_WIFI_IF}' -p udp -m multiport --dports 5060,5062,5064,10000,10002,10004 -j DSCP --set-dscp 46 2>/dev/null || true" >/dev/null 2>&1 || true
+        fi
     fi
 
     # 4. Start iperf3 server in ns-wan
