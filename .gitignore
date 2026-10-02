@@ -34,4 +34,6 @@ __pycache__/
 # Compiled tools & binaries
 tools/bin/*
 !tools/bin/.gitkeep
+tools/lib/*
+!tools/lib/.gitkeep
 pcap/

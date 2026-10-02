@@ -1506,6 +1506,31 @@ run_phase_voice_qos() {
     b_mbps="$("${tools_dir}/metric_parser.py" sum-mbps "${pc_call_out}")"
     log_info "  Concurrent PC throughput (B): ${b_mbps} Mbps"
 
+    # Verify that calls were actually running and did not terminate prematurely
+    local verified_calls=2
+    if [[ -n "${phone1_pid}" ]] && ! kill -0 "${phone1_pid}" 2>/dev/null; then
+        log_error "Phone 1 VoIP client terminated prematurely during the test!"
+        verified_calls=$(( verified_calls - 1 ))
+    fi
+
+    if [[ "${eff_mode}" == "distributed" ]]; then
+        local remote_alive
+        remote_alive="$("${SCRIPT_DIR}/remote_client.sh" exec "pgrep -f '(pjsua|sipp|voip_call_simulator)' >/dev/null && echo 1 || echo 0" 2>/dev/null | tr -d '\r\n ' || echo 0)"
+        if [[ "${remote_alive}" != "1" ]]; then
+            log_error "Remote Phone 2 VoIP client terminated prematurely or failed during the test!"
+            verified_calls=$(( verified_calls - 1 ))
+        fi
+    elif [[ -n "${phone2_pid}" ]] && ! kill -0 "${phone2_pid}" 2>/dev/null; then
+        log_error "Phone 2 VoIP client terminated prematurely during the test!"
+        verified_calls=$(( verified_calls - 1 ))
+    fi
+
+    if (( verified_calls < 2 )); then
+        log_error "VoIP load generator verification FAILED: Only ${verified_calls}/2 calls active."
+    else
+        log_pass "Both VoIP calls verified continuously active throughout throughput test."
+    fi
+
     # Clean up background VoIP processes and iperf server
     if [[ -n "${phone1_pid}" ]]; then kill "${phone1_pid}" 2>/dev/null || true; fi
     if [[ -n "${phone2_pid}" ]]; then kill "${phone2_pid}" 2>/dev/null || true; fi
@@ -1533,6 +1558,7 @@ run_phase_voice_qos() {
         --wifi-if "${DETECTED_WIFI_IF:-}" \
         --wifi-ssid "${DETECTED_WIFI_SSID:-}" \
         --calls 2 \
+        --verified-calls "${verified_calls}" \
         --tolerance "${VOIP_IMPACT_TOLERANCE_PCT:-1.0}" \
         --output "${voice_json}"
 }

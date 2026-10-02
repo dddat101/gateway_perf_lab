@@ -170,9 +170,19 @@ def cmd_eval_qos(args: argparse.Namespace) -> int:
     a = float(args.baseline)
     b = float(args.during)
     tol = float(args.tolerance)
+    calls_expected = getattr(args, "calls", 2)
+    calls_verified = getattr(args, "verified_calls", calls_expected)
 
     diff_pct = (abs(a - b) / a * 100.0) if a > 0 else 0.0
-    verdict = "PASS" if diff_pct <= tol else "FAIL"
+    if calls_verified < calls_expected:
+        verdict = "FAIL"
+        reason = f"Generator failure: only {calls_verified}/{calls_expected} VoIP calls verified active during measurement"
+    elif diff_pct > tol:
+        verdict = "FAIL"
+        reason = f"Wired PC degradation {diff_pct:.3f}% exceeds tolerance {tol}%"
+    else:
+        verdict = "PASS"
+        reason = f"Wired PC degradation {diff_pct:.3f}% within tolerance {tol}% with {calls_verified}/{calls_expected} active calls"
 
     result = {
         "test": "pc_throughput_during_voip_calls",
@@ -180,12 +190,14 @@ def cmd_eval_qos(args: argparse.Namespace) -> int:
         "engine": getattr(args, "engine", "auto"),
         "wifi_device": getattr(args, "wifi_if", ""),
         "wifi_ssid": getattr(args, "wifi_ssid", ""),
-        "active_calls": getattr(args, "calls", 2),
+        "active_calls": calls_expected,
+        "verified_calls": calls_verified,
         "pc_baseline_mbps": round(a, 2),
         "pc_during_calls_mbps": round(b, 2),
         "diff_percentage": round(diff_pct, 3),
         "tolerance_threshold_pct": tol,
-        "verdict": verdict
+        "verdict": verdict,
+        "reason": reason
     }
 
     output_json = json.dumps(result, indent=2)
@@ -364,6 +376,7 @@ def main() -> int:
     p_qos.add_argument("--wifi-if", default="", help="Wi-Fi interface used.")
     p_qos.add_argument("--wifi-ssid", default="", help="Connected Wi-Fi SSID.")
     p_qos.add_argument("--calls", default=2, type=int, help="Number of concurrent calls.")
+    p_qos.add_argument("--verified-calls", default=2, type=int, help="Number of verified active calls during test.")
     p_qos.add_argument("--tolerance", default=1.0, type=float, help="Max allowed degradation percent (default: 1.0).")
     p_qos.add_argument("--output", "-o", help="Optional path to output evaluation JSON.")
     p_qos.set_defaults(func=cmd_eval_qos)

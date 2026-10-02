@@ -274,8 +274,14 @@ main() {
             mode_note=" | Engine: ${q_eng}"
         fi
 
-        check_assertion "TC-QOS-01" "PC Throughput during 2 Wi-Fi Phone Calls (|A-B|/A <= 1%)" "${q_verdict}" \
-            "Baseline (A): ${q_a} Mbps | During Calls (B): ${q_b} Mbps | Drop: ${q_diff}% (Limit: <= 1.0%)${mode_note}"
+        local q_reason
+        q_reason="$(parse_json_field "${qos_log}" "reason")"
+        local detail_str="Baseline (A): ${q_a} Mbps | During Calls (B): ${q_b} Mbps | Drop: ${q_diff}% (Limit: <= 1.0%)${mode_note}"
+        if [[ "${q_verdict}" != "PASS" && "${q_reason}" != "MISSING" && -n "${q_reason}" ]]; then
+            detail_str="${detail_str} | Failure: ${q_reason}"
+        fi
+
+        check_assertion "TC-QOS-01" "PC Throughput during 2 Wi-Fi Phone Calls (|A-B|/A <= 1%)" "${q_verdict}" "${detail_str}"
     else
         check_assertion "TC-QOS-01" "PC Throughput during 2 Wi-Fi Phone Calls (|A-B|/A <= 1%)" "NOT_RUN" "Phase not executed (run: sudo ./scripts/scenario.sh voice_qos)"
     fi

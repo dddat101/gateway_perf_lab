@@ -392,12 +392,13 @@ cmd_run_voip() {
     fi
 
     local log_file="/tmp/voip_${phone_id}.log"
+    local env_prefix="export PATH=\"./tools/bin:\$PATH\"; export LD_LIBRARY_PATH=\"\${PWD}/tools/lib:\$LD_LIBRARY_PATH\";"
     if [[ "${engine}" == "pjsua" ]]; then
         local ip_opt=""
         if [[ -n "${remote_wifi_ip}" ]]; then
             ip_opt="--ip-addr=${remote_wifi_ip} --bound-addr=${remote_wifi_ip}"
         fi
-        remote_cmd="export PATH=\"./tools/bin:\$PATH\"; nohup pjsua --local-port=${local_port} --rtp-port=${rtp_port} --null-audio ${ip_opt} --duration=${duration} --set-qos --no-cli-console --app-log-level=0 'sip:${server_ip}:${server_port}' > \"${log_file}\" 2>&1 < /dev/null & echo \$!"
+        remote_cmd="${env_prefix} nohup pjsua --local-port=${local_port} --rtp-port=${rtp_port} --null-audio ${ip_opt} --duration=${duration} --set-qos --no-cli-console --app-log-level=0 'sip:${server_ip}:${server_port}' > \"${log_file}\" 2>&1 < /dev/null & echo \$!"
 
     elif [[ "${engine}" == "sipp" ]]; then
         local ip_opt=""
@@ -405,14 +406,14 @@ cmd_run_voip() {
             ip_opt="-i ${remote_wifi_ip}"
         fi
         local sipp_dur_ms=$(( duration * 1000 ))
-        remote_cmd="export PATH=\"./tools/bin:\$PATH\"; nohup sipp -sn uac '${server_ip}:${server_port}' ${ip_opt} -p ${local_port} -mp ${rtp_port} -m 1 -d ${sipp_dur_ms} -nostdin > \"${log_file}\" 2>&1 < /dev/null & echo \$!"
+        remote_cmd="${env_prefix} nohup sipp -sn uac '${server_ip}:${server_port}' ${ip_opt} -p ${local_port} -mp ${rtp_port} -m 1 -d ${sipp_dur_ms} -nostdin > \"${log_file}\" 2>&1 < /dev/null & echo \$!"
 
     else
         local ip_opt=""
         if [[ -n "${remote_wifi_ip}" ]]; then
             ip_opt="--bind-ip ${remote_wifi_ip}"
         fi
-        remote_cmd="nohup python3 tools/voip_call_simulator.py client --server-ip ${server_ip} --server-port ${rtp_port} ${ip_opt} --duration ${duration} --phone-id ${phone_id} > \"${log_file}\" 2>&1 < /dev/null & echo \$!"
+        remote_cmd="${env_prefix} nohup python3 tools/voip_call_simulator.py client --server-ip ${server_ip} --server-port ${rtp_port} ${ip_opt} --duration ${duration} --phone-id ${phone_id} > \"${log_file}\" 2>&1 < /dev/null & echo \$!"
     fi
 
     log_info "Launching remote Phone 2 VoIP client on ${TARGET_HOST}..."
@@ -421,10 +422,25 @@ cmd_run_voip() {
 
     local spawned_pid
     spawned_pid="$(remote_ssh_exec "${remote_cmd}" 2>/dev/null | tr -d '\r\n ' || true)"
+
+    # Verify process actually started and is running
+    local is_alive=0
+    local log_snippet=""
     if [[ -n "${spawned_pid}" && "${spawned_pid}" =~ ^[0-9]+$ ]]; then
+        sleep 0.5
+        is_alive="$(remote_ssh_raw "kill -0 ${spawned_pid} 2>/dev/null && echo 1 || echo 0" 2>/dev/null | tr -d '\r\n ' || true)"
+    fi
+
+    if [[ "${is_alive}" == "1" ]]; then
         log_success "Remote VoIP client [${phone_id}] active on ${TARGET_HOST} (PID: ${spawned_pid}, Log: ${log_file})."
+        return 0
     else
-        log_warn "Remote VoIP client [${phone_id}] launched (Check ${TARGET_HOST}:${log_file})."
+        log_snippet="$(remote_ssh_raw "cat ${log_file} 2>/dev/null | tr '\n' ' ' | head -c 200" 2>/dev/null || true)"
+        log_error "Remote VoIP client [${phone_id}] FAILED to run on ${TARGET_HOST}!"
+        if [[ -n "${log_snippet}" ]]; then
+            log_error "  Remote error log: ${log_snippet}"
+        fi
+        return 1
     fi
 }
 
@@ -433,14 +449,18 @@ cmd_clean() {
     log_info "Target Endpoint: ${TARGET_USER}@${TARGET_HOST}"
 
     local clean_script='
-        pkill -TERM -f "iperf3 -c" 2>/dev/null || true
-        pkill -TERM -f "traffic_generator.py" 2>/dev/null || true
-        pkill -TERM -f "tcpdump -i" 2>/dev/null || true
-        pkill -TERM -f "pjsua" 2>/dev/null || true
-        pkill -TERM -f "sipp" 2>/dev/null || true
-        pkill -TERM -f "voip_call_simulator.py" 2>/dev/null || true
+        for proc in iperf3 pjsua sipp; do
+            pkill -TERM -x "${proc}" 2>/dev/null || true
+        done
+        pkill -TERM -f "[t]raffic_generator.py" 2>/dev/null || true
+        pkill -TERM -f "[v]oip_call_simulator.py" 2>/dev/null || true
+        pkill -TERM -f "[t]cpdump -i" 2>/dev/null || true
         sleep 0.2
-        pkill -KILL -f "iperf3 -c|traffic_generator|tcpdump -i|pjsua|sipp|voip_call_simulator" 2>/dev/null || true
+        for proc in iperf3 pjsua sipp; do
+            pkill -KILL -x "${proc}" 2>/dev/null || true
+        done
+        pkill -KILL -f "[t]raffic_generator.py" 2>/dev/null || true
+        pkill -KILL -f "[v]oip_call_simulator.py" 2>/dev/null || true
         echo "Remote processes cleaned."
     '
     remote_ssh_raw "${clean_script}"
