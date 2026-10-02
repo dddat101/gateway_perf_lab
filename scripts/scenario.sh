@@ -570,25 +570,27 @@ run_remote_station_trials() {
     local remote_host="${REMOTE_CLIENT_HOST:-}"
     local remote_script="${SCRIPT_DIR}/remote_client.sh"
 
-    local remote_wifi_if="${REMOTE_CLIENT_WIFI_IF:-auto}"
-    if [[ "${remote_wifi_if}" == "auto" || -z "${remote_wifi_if}" ]]; then
-        remote_wifi_if="$("${remote_script}" exec 'iw dev 2>/dev/null | awk "/Interface/ {print \$2}" | head -n1' 2>/dev/null || echo "wlan0")"
-        remote_wifi_if="$(echo "${remote_wifi_if}" | tr -d '\r\n[:space:]')"
+    local remote_env_dump
+    remote_env_dump="$("${remote_script}" wifi-env --check-ping "${DUT_LAN_IP:-192.168.1.1}" 2>/dev/null || true)"
+    eval "${remote_env_dump}"
+
+    local remote_wifi_if="${REMOTE_WIFI_IF:-wlan0}"
+    local remote_status="${REMOTE_WIFI_STATUS:-DISCONNECTED}"
+
+    log_info "  -> Remote Wi-Fi Station   : ${remote_host} (${remote_wifi_if} [${remote_status}])"
+    log_info "     * Target SSID & Band   : '${REMOTE_WIFI_SSID:-none}' (${REMOTE_WIFI_BAND:-none} / Ch ${REMOTE_WIFI_CHANNEL:-?}, Width: ${REMOTE_WIFI_WIDTH:-?})"
+    log_info "     * Signal & Bitrate     : ${REMOTE_WIFI_SIGNAL:-none} (Tx: ${REMOTE_WIFI_BITRATE:-none})"
+    log_info "     * Station IPv4 Address : ${REMOTE_WIFI_IP:-none} (Gateway: ${REMOTE_WIFI_GATEWAY:-none})"
+    if [[ "${REMOTE_WIFI_PING_OK:-0}" == "1" ]]; then
+        log_pass "     * Remote DUT Reachability: OK (Ping to ${DUT_LAN_IP:-192.168.1.1}: ${REMOTE_WIFI_PING_RTT})"
+    else
+        log_warn "     * Remote DUT Reachability: FAILED (Cannot ping gateway ${DUT_LAN_IP:-192.168.1.1})"
+        log_warn "     * Please ensure Remote PC is connected to DUT SSID ('${DUT_SSID_2G:-DUT}' / '${DUT_SSID_5G:-DUT}')."
     fi
-    log_info "  -> Remote Wi-Fi Adapter   : ${remote_wifi_if:-wlan0}"
 
     local bind_opt=()
     if [[ -n "${remote_wifi_if}" ]]; then
         bind_opt=("--bind-dev" "${remote_wifi_if}")
-    fi
-
-    # Pre-flight check: Verify remote PC can reach DUT gateway / WAN IP over Wi-Fi
-    log_info "Verifying remote Wi-Fi connectivity to DUT..."
-    if ! "${remote_script}" exec "ping -c 1 -W 2 -I ${remote_wifi_if} ${DUT_LAN_IP:-192.168.1.1} >/dev/null 2>&1"; then
-        log_warn "Remote Wi-Fi (${remote_wifi_if}) cannot ping DUT gateway (${DUT_LAN_IP:-192.168.1.1})!"
-        log_warn "Please ensure Remote PC is connected to DUT SSID ('${DUT_SSID_2G:-DUT}' / '${DUT_SSID_5G:-DUT}')."
-    else
-        log_pass "Remote Wi-Fi (${remote_wifi_if}) is successfully connected to DUT network."
     fi
 
     local a_trials=()
@@ -675,15 +677,16 @@ run_tri_station_trials() {
     local remote_script="${SCRIPT_DIR}/remote_client.sh"
     local local_wifi_if="${DETECTED_WIFI_IF:-wlp3s0}"
 
-    local remote_wifi_if="${REMOTE_CLIENT_WIFI_IF:-auto}"
-    if [[ "${remote_wifi_if}" == "auto" || -z "${remote_wifi_if}" ]]; then
-        remote_wifi_if="$("${remote_script}" exec 'iw dev 2>/dev/null | awk "/Interface/ {print \$2}" | head -n1' 2>/dev/null || echo "wlan0")"
-        remote_wifi_if="$(echo "${remote_wifi_if}" | tr -d '\r\n[:space:]')"
-    fi
+    local remote_env_dump
+    remote_env_dump="$("${remote_script}" wifi-env --check-ping "${DUT_LAN_IP:-192.168.1.1}" 2>/dev/null || true)"
+    eval "${remote_env_dump}"
+
+    local remote_wifi_if="${REMOTE_WIFI_IF:-wlan0}"
+    local remote_status="${REMOTE_WIFI_STATUS:-DISCONNECTED}"
 
     log_info "  -> Local Wired PC Adapter   : ${PC_IF:-enx6c1ff76608e2} (ns-pc: 1 Gbps LAN)"
-    log_info "  -> Local Wi-Fi Adapter (5G) : ${local_wifi_if} (SSID: '${DETECTED_WIFI_SSID:-U+NetF254_5G}')"
-    log_info "  -> Remote Wi-Fi Station (2G): ${remote_wifi_if} @ ${remote_host} (SSID: 'U+NetF254')"
+    log_info "  -> Local Wi-Fi Adapter      : ${local_wifi_if} [${DETECTED_WIFI_STATUS:-CONNECTED}] (SSID: '${DETECTED_WIFI_SSID:-DUT}', Band: ${DETECTED_WIFI_BAND:-none}, Signal: ${DETECTED_WIFI_SIGNAL:-none})"
+    log_info "  -> Remote Wi-Fi Station     : ${remote_host} (${remote_wifi_if} [${remote_status}], SSID: '${REMOTE_WIFI_SSID:-none}', Band: ${REMOTE_WIFI_BAND:-none}, Signal: ${REMOTE_WIFI_SIGNAL:-none})"
 
     local bind_opt=()
     if [[ -n "${remote_wifi_if}" ]]; then
@@ -691,16 +694,20 @@ run_tri_station_trials() {
     fi
 
     # Pre-flight checks: Verify local & remote Wi-Fi connectivity to DUT gateway
-    log_info "Verifying Local Wi-Fi (5GHz) connectivity to DUT..."
+    log_info "Verifying Local Wi-Fi connectivity to DUT..."
     if ! ping -c 1 -W 2 -I "${local_wifi_if}" "${DUT_LAN_IP:-192.168.1.1}" >/dev/null 2>&1; then
         log_warn "Local Wi-Fi (${local_wifi_if}) cannot ping DUT gateway! Attempting reconnect to 5G..."
         "${SCRIPT_DIR}/wifi_connect.sh" connect 5g || true
+    else
+        log_pass "Local Wi-Fi (${local_wifi_if}) reachability to DUT is verified."
     fi
 
-    log_info "Verifying Remote Wi-Fi (2.4GHz) connectivity to DUT..."
-    if ! "${remote_script}" exec "ping -c 1 -W 2 -I ${remote_wifi_if} ${DUT_LAN_IP:-192.168.1.1} >/dev/null 2>&1"; then
+    log_info "Verifying Remote Wi-Fi connectivity to DUT..."
+    if [[ "${REMOTE_WIFI_PING_OK:-0}" != "1" ]]; then
         log_warn "Remote Wi-Fi (${remote_wifi_if}) cannot ping DUT gateway! Attempting reconnect to 2G..."
         "${remote_script}" wifi-connect 2g || true
+    else
+        log_pass "Remote Wi-Fi (${remote_wifi_if}) reachability to DUT is verified (Ping RTT: ${REMOTE_WIFI_PING_RTT})."
     fi
 
     local a_trials=()
@@ -1221,7 +1228,7 @@ run_phase_voice_qos() {
 
     # 2. Topology Mode Detection
     local env_dump
-    env_dump="$("${tools_dir}/wifi_inspector.py" export-env 2>/dev/null || true)"
+    env_dump="$("${tools_dir}/wifi_inspector.py" export-env --check-ping "${DUT_LAN_IP:-192.168.1.1}" 2>/dev/null || true)"
     eval "${env_dump}"
 
     local eff_mode="${CUSTOM_WIFI_MODE:-auto}"
@@ -1246,16 +1253,41 @@ run_phase_voice_qos() {
         eff_mode="virtual"
     fi
 
-    local wifi_ip=""
-    if [[ "${eff_mode}" == "physical_single" || "${eff_mode}" == "distributed" ]]; then
+    local wifi_ip="${DETECTED_WIFI_IP:-}"
+    if [[ -z "${wifi_ip}" && ( "${eff_mode}" == "physical_single" || "${eff_mode}" == "distributed" ) ]]; then
         wifi_ip="$(ip -4 -o addr show dev "${DETECTED_WIFI_IF:-wlp3s0}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)"
+    fi
+
+    # In distributed mode, query remote client Wi-Fi connection state
+    if [[ "${eff_mode}" == "distributed" ]]; then
+        local remote_env_dump
+        remote_env_dump="$("${SCRIPT_DIR}/remote_client.sh" wifi-env --check-ping "${DUT_LAN_IP:-192.168.1.1}" 2>/dev/null || true)"
+        eval "${remote_env_dump}"
     fi
 
     log_info "VoIP QoS Test Mode : [${eff_mode^^}] | Engine: [${engine^^}]"
     if [[ "${eff_mode}" == "physical_single" || "${eff_mode}" == "distributed" ]]; then
-        log_info "  -> Local Wi-Fi Adapter    : ${DETECTED_WIFI_IF:-none} (SSID: '${DETECTED_WIFI_SSID:-DUT}', IP: ${wifi_ip:-unknown})"
+        local local_status="${DETECTED_WIFI_STATUS:-DISCONNECTED}"
+        log_info "  -> Local Wi-Fi Adapter    : ${DETECTED_WIFI_IF:-none} [${local_status}] (SSID: '${DETECTED_WIFI_SSID:-DUT}', IP: ${wifi_ip:-unknown}, Band: ${DETECTED_WIFI_BAND:-unknown}, Signal: ${DETECTED_WIFI_SIGNAL:-unknown})"
+        if [[ "${DETECTED_WIFI_PING_OK:-0}" == "1" ]]; then
+            log_pass "     * Local DUT Reachability : OK (Ping to ${DUT_LAN_IP:-192.168.1.1}: ${DETECTED_WIFI_PING_RTT})"
+        else
+            log_warn "     * Local DUT Reachability : FAILED (Cannot ping gateway ${DUT_LAN_IP:-192.168.1.1})"
+        fi
+
         if [[ "${eff_mode}" == "distributed" ]]; then
+            local remote_status="${REMOTE_WIFI_STATUS:-DISCONNECTED}"
             log_info "  -> Remote Wi-Fi Station   : ${REMOTE_CLIENT_HOST} (via SSH)"
+            log_info "     * Interface & Status   : ${REMOTE_WIFI_IF:-none} [${remote_status}] (MAC: ${REMOTE_WIFI_MAC:-none})"
+            log_info "     * Target SSID & Band   : '${REMOTE_WIFI_SSID:-none}' (${REMOTE_WIFI_BAND:-none} / Ch ${REMOTE_WIFI_CHANNEL:-?}, Width: ${REMOTE_WIFI_WIDTH:-?})"
+            log_info "     * Signal & Bitrate     : ${REMOTE_WIFI_SIGNAL:-none} (Tx: ${REMOTE_WIFI_BITRATE:-none})"
+            log_info "     * Station IPv4 Address : ${REMOTE_WIFI_IP:-none} (Gateway: ${REMOTE_WIFI_GATEWAY:-none})"
+            if [[ "${REMOTE_WIFI_PING_OK:-0}" == "1" ]]; then
+                log_pass "     * Remote DUT Reachability: OK (Ping to ${DUT_LAN_IP:-192.168.1.1}: ${REMOTE_WIFI_PING_RTT})"
+            else
+                log_warn "     * Remote DUT Reachability: FAILED (Cannot ping gateway ${DUT_LAN_IP:-192.168.1.1})"
+                log_warn "     * Please ensure Remote PC is connected to DUT SSID ('${DUT_SSID_2G:-DUT}' / '${DUT_SSID_5G:-DUT}')."
+            fi
         fi
     fi
     log_info "  -> Wired PC Adapter       : ${PC_IF:-enx6c1ff76608e2} (ns-pc: 1 Gbps LAN)"
@@ -1301,6 +1333,17 @@ run_phase_voice_qos() {
 
     # Step 2: Start VoIP server and 2 Wi-Fi phone calls
     log_info "Starting VoIP media server and 2 active Wi-Fi phone calls using [${engine^^}]..."
+    log_info "  -> Media Server (UAS)  : ns-wan:5060 (Listening for incoming SIP/RTP media)"
+    if [[ "${eff_mode}" == "physical_single" ]]; then
+        log_info "  -> Phone 1 (Physical)  : ${DETECTED_WIFI_IF} (${wifi_ip}:5062 -> RTP 10000 -> ${WAN_SERVER_IP:-10.10.0.1}:5060)"
+        log_info "  -> Phone 2 (Physical)  : ${DETECTED_WIFI_IF} (${wifi_ip}:5064 -> RTP 10002 -> ${WAN_SERVER_IP:-10.10.0.1}:5060)"
+    elif [[ "${eff_mode}" == "distributed" ]]; then
+        log_info "  -> Phone 1 (Local Wi-Fi): ${DETECTED_WIFI_IF} (${wifi_ip}:5062 -> RTP 10000 -> ${WAN_SERVER_IP:-10.10.0.1}:5060)"
+        log_info "  -> Phone 2 (Remote Wi-Fi): ${REMOTE_CLIENT_HOST} (${REMOTE_WIFI_IF:-wlan0}:${REMOTE_WIFI_IP:-unknown}:5064 -> RTP 10002 -> ${WAN_SERVER_IP:-10.10.0.1}:5060)"
+    else
+        log_info "  -> Phone 1 (Virtual)   : ns-phone1 (5060 -> RTP 10000 -> ${WAN_SERVER_IP:-10.10.0.1}:5060)"
+        log_info "  -> Phone 2 (Virtual)   : ns-phone2 (5062 -> RTP 10002 -> ${WAN_SERVER_IP:-10.10.0.1}:5060)"
+    fi
     local voip_srv_pid=""
     local phone1_pid=""
     local phone2_pid=""
@@ -1340,9 +1383,7 @@ run_phase_voice_qos() {
                 --local-port 5064 \
                 --rtp-port 10002 \
                 --duration "${call_duration}" \
-                --phone-id "phone-2" >/dev/null 2>&1 &
-            phone2_pid=$!
-            ACTIVE_BG_PIDS+=("${phone2_pid}")
+                --phone-id "phone-2" || true
 
         else
             ip netns exec "${PHONE1_NS:-ns-phone1}" "${pjsua_bin}" \
@@ -1387,9 +1428,7 @@ run_phase_voice_qos() {
                 --local-port 5064 \
                 --rtp-port 10002 \
                 --duration "${call_duration}" \
-                --phone-id "phone-2" >/dev/null 2>&1 &
-            phone2_pid=$!
-            ACTIVE_BG_PIDS+=("${phone2_pid}")
+                --phone-id "phone-2" || true
 
         else
             ip netns exec "${PHONE1_NS:-ns-phone1}" "${sipp_bin}" -sn uac "${WAN_SERVER_IP:-10.10.0.1}:5060" \
@@ -1439,9 +1478,7 @@ run_phase_voice_qos() {
                 --server-ip "${WAN_SERVER_IP:-10.10.0.1}" \
                 --server-port 10002 \
                 --duration "${call_duration}" \
-                --phone-id "phone-2" >/dev/null 2>&1 &
-            phone2_pid=$!
-            ACTIVE_BG_PIDS+=("${phone2_pid}")
+                --phone-id "phone-2" || true
 
         else
             ip netns exec "${PHONE1_NS:-ns-phone1}" "${tools_dir}/voip_call_simulator.py" client \
@@ -1458,6 +1495,7 @@ run_phase_voice_qos() {
         fi
     fi
 
+    log_pass "VoIP call media streams active on Wi-Fi client stations."
     sleep 1.0 # Allow calls to establish and stabilize
 
     # Step 3: Measure PC Throughput during active calls (B)

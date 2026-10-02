@@ -42,6 +42,8 @@ Commands:
                      (excludes .git, logs, captures, state).
   status             Query remote PC network interfaces and Wi-Fi state.
   wifi-connect <bnd> Connect remote PC to DUT SSID (2g, 5g, 6g).
+  wifi-status, info  Query remote PC Wi-Fi connection, SSID, Band, Signal, IP, and DUT reachability.
+  wifi-env [opts]    Export remote PC Wi-Fi environment variables suitable for eval / source.
   wifi-ip            Query and print remote PC active Wi-Fi IPv4 address.
   run-iperf [args]   Execute iperf3 client on remote PC towards WAN server.
   run-voip [opts]    Execute VoIP call client (pjsua, sipp, python) on remote PC.
@@ -303,18 +305,42 @@ cmd_run_iperf() {
     remote_ssh_raw "${iperf_cmd}"
 }
 
-cmd_get_wifi_ip() {
-    local wifi_ip
-    wifi_ip="$(remote_ssh_raw "
-        ( ip -4 -o addr show 2>/dev/null | awk '\$2 ~ /^(wl|wlan)/ {print \$4}' | cut -d/ -f1 | head -n1 ) || true
-    " 2>/dev/null | tr -d '\r\n ')"
-
-    if [[ -z "${wifi_ip}" ]]; then
-        wifi_ip="$(remote_ssh_raw "
-            ( ip -4 -o addr show 2>/dev/null | awk '\$2 !~ /^(lo|docker|br|veth)/ {print \$4}' | cut -d/ -f1 | head -n1 ) || true
-        " 2>/dev/null | tr -d '\r\n ')"
+cmd_get_wifi_env() {
+    local -a extra_args=("$@")
+    local remote_cmd="python3 tools/wifi_inspector.py export-env --prefix REMOTE_"
+    if (( ${#extra_args[@]} > 0 )); then
+        remote_cmd+=" $(IFS=' '; echo "${extra_args[*]}")"
     fi
-    echo "${wifi_ip}"
+    remote_ssh_exec "${remote_cmd}"
+}
+
+cmd_wifi_status() {
+    print_header "REMOTE CLIENT WI-FI CONNECTION STATUS"
+    log_info "Target Endpoint : ${TARGET_USER}@${TARGET_HOST}"
+
+    local env_dump
+    env_dump="$(cmd_get_wifi_env --check-ping "${DUT_LAN_IP:-192.168.1.1}" 2>/dev/null || true)"
+    eval "${env_dump}"
+
+    local status_label="${REMOTE_WIFI_STATUS:-DISCONNECTED}"
+    log_info "  -> Remote Interface : ${REMOTE_WIFI_IF:-none} [${status_label}] (MAC: ${REMOTE_WIFI_MAC:-none})"
+    log_info "  -> Target SSID      : '${REMOTE_WIFI_SSID:-none}' (BSSID: ${REMOTE_WIFI_BSSID:-none})"
+    log_info "  -> Band & Frequency : ${REMOTE_WIFI_BAND:-none} (Ch: ${REMOTE_WIFI_CHANNEL:-none}, Width: ${REMOTE_WIFI_WIDTH:-none})"
+    log_info "  -> Signal & Bitrate : ${REMOTE_WIFI_SIGNAL:-none} (Tx: ${REMOTE_WIFI_BITRATE:-none})"
+    log_info "  -> Station IP (DHCP): ${REMOTE_WIFI_IP:-none} (Gateway: ${REMOTE_WIFI_GATEWAY:-none})"
+    if [[ "${REMOTE_WIFI_PING_OK:-0}" == "1" ]]; then
+        log_success "  -> DUT Reachability : REACHABLE (Ping RTT: ${REMOTE_WIFI_PING_RTT:-<1ms})"
+    else
+        log_warn "  -> DUT Reachability : UNREACHABLE (Failed ping to ${DUT_LAN_IP:-192.168.1.1})"
+    fi
+    print_section "STATUS QUERY COMPLETE"
+}
+
+cmd_get_wifi_ip() {
+    local env_dump
+    env_dump="$(cmd_get_wifi_env 2>/dev/null || true)"
+    eval "${env_dump}"
+    echo "${REMOTE_WIFI_IP:-}"
 }
 
 cmd_run_voip() {
@@ -339,9 +365,14 @@ cmd_run_voip() {
         esac
     done
 
-    # Probe remote Wi-Fi IP
-    local remote_wifi_ip
-    remote_wifi_ip="$(cmd_get_wifi_ip)"
+    # Probe remote Wi-Fi status & IP
+    local env_dump
+    env_dump="$(cmd_get_wifi_env 2>/dev/null || true)"
+    eval "${env_dump}"
+    local remote_wifi_ip="${REMOTE_WIFI_IP:-}"
+    local remote_wifi_if="${REMOTE_WIFI_IF:-wlan0}"
+    local remote_ssid="${REMOTE_WIFI_SSID:-none}"
+    local remote_status="${REMOTE_WIFI_STATUS:-DISCONNECTED}"
 
     local remote_cmd=""
     if [[ "${engine}" == "pjsua" || "${engine}" == "auto" ]]; then
@@ -360,12 +391,13 @@ cmd_run_voip() {
         fi
     fi
 
+    local log_file="/tmp/voip_${phone_id}.log"
     if [[ "${engine}" == "pjsua" ]]; then
         local ip_opt=""
         if [[ -n "${remote_wifi_ip}" ]]; then
             ip_opt="--ip-addr=${remote_wifi_ip} --bound-addr=${remote_wifi_ip}"
         fi
-        remote_cmd="export PATH=\"./tools/bin:\$PATH\"; pjsua --local-port=${local_port} --rtp-port=${rtp_port} --null-audio ${ip_opt} --duration=${duration} --set-qos --no-cli-console --app-log-level=0 'sip:${server_ip}:${server_port}' >/dev/null 2>&1 &"
+        remote_cmd="export PATH=\"./tools/bin:\$PATH\"; nohup pjsua --local-port=${local_port} --rtp-port=${rtp_port} --null-audio ${ip_opt} --duration=${duration} --set-qos --no-cli-console --app-log-level=0 'sip:${server_ip}:${server_port}' > \"${log_file}\" 2>&1 < /dev/null & echo \$!"
 
     elif [[ "${engine}" == "sipp" ]]; then
         local ip_opt=""
@@ -373,18 +405,27 @@ cmd_run_voip() {
             ip_opt="-i ${remote_wifi_ip}"
         fi
         local sipp_dur_ms=$(( duration * 1000 ))
-        remote_cmd="export PATH=\"./tools/bin:\$PATH\"; sipp -sn uac '${server_ip}:${server_port}' ${ip_opt} -p ${local_port} -mp ${rtp_port} -m 1 -d ${sipp_dur_ms} -nostdin >/dev/null 2>&1 &"
+        remote_cmd="export PATH=\"./tools/bin:\$PATH\"; nohup sipp -sn uac '${server_ip}:${server_port}' ${ip_opt} -p ${local_port} -mp ${rtp_port} -m 1 -d ${sipp_dur_ms} -nostdin > \"${log_file}\" 2>&1 < /dev/null & echo \$!"
 
     else
         local ip_opt=""
         if [[ -n "${remote_wifi_ip}" ]]; then
             ip_opt="--bind-ip ${remote_wifi_ip}"
         fi
-        remote_cmd="python3 tools/voip_call_simulator.py client --server-ip ${server_ip} --server-port ${rtp_port} ${ip_opt} --duration ${duration} --phone-id ${phone_id} >/dev/null 2>&1 &"
+        remote_cmd="nohup python3 tools/voip_call_simulator.py client --server-ip ${server_ip} --server-port ${rtp_port} ${ip_opt} --duration ${duration} --phone-id ${phone_id} > \"${log_file}\" 2>&1 < /dev/null & echo \$!"
     fi
 
-    log_info "Launching remote VoIP client on ${TARGET_HOST} (Engine: ${engine^^}, Port: ${rtp_port}, Duration: ${duration}s)..."
-    remote_ssh_exec "${remote_cmd}"
+    log_info "Launching remote Phone 2 VoIP client on ${TARGET_HOST}..."
+    log_info "  -> Remote Wi-Fi Link : ${remote_wifi_if} [${remote_status}] (SSID: '${remote_ssid}', IP: ${remote_wifi_ip:-unknown})"
+    log_info "  -> VoIP Engine       : [${engine^^}] | Server: ${server_ip}:${server_port} | RTP: ${rtp_port} | Duration: ${duration}s"
+
+    local spawned_pid
+    spawned_pid="$(remote_ssh_exec "${remote_cmd}" 2>/dev/null | tr -d '\r\n ' || true)"
+    if [[ -n "${spawned_pid}" && "${spawned_pid}" =~ ^[0-9]+$ ]]; then
+        log_success "Remote VoIP client [${phone_id}] active on ${TARGET_HOST} (PID: ${spawned_pid}, Log: ${log_file})."
+    else
+        log_warn "Remote VoIP client [${phone_id}] launched (Check ${TARGET_HOST}:${log_file})."
+    fi
 }
 
 cmd_clean() {
@@ -478,6 +519,16 @@ main() {
                     shift
                 fi
                 ;;
+            wifi-status|status-wifi|wifi-info)
+                action="wifi-status"
+                shift
+                ;;
+            wifi-env)
+                action="wifi-env"
+                shift
+                extra_args+=("$@")
+                break
+                ;;
             wifi-ip|get-wifi-ip)
                 action="wifi-ip"
                 shift
@@ -524,6 +575,12 @@ main() {
             ;;
         wifi-connect)
             cmd_wifi_connect "${extra_args[@]:-}"
+            ;;
+        wifi-status)
+            cmd_wifi_status
+            ;;
+        wifi-env)
+            cmd_get_wifi_env "${extra_args[@]:-}"
             ;;
         wifi-ip)
             cmd_get_wifi_ip

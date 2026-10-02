@@ -110,6 +110,28 @@ print_namespaces_section() {
             "[Host] ${wif}" "Physical OTA Wi-Fi" "PHYSICAL" "OTA Hardware (RF)" "${ssid_disp}" "${w_ip}" "${w_gw}" "${status_colored}"
     done
 
+    # --- Remote Wi-Fi Station Row ---
+    if [[ -n "${REMOTE_CLIENT_HOST:-}" ]] && [[ -x "${SCRIPT_DIR}/remote_client.sh" ]]; then
+        local r_env
+        r_env="$("${SCRIPT_DIR}/remote_client.sh" wifi-env 2>/dev/null || true)"
+        if [[ -n "${r_env}" ]]; then
+            eval "${r_env}"
+            local r_status="${REMOTE_WIFI_STATUS:-DISCONNECTED}"
+            local r_colored
+            if [[ "${r_status}" == "CONNECTED" ]]; then
+                r_colored="\e[1;32mCONNECTED\e[0m"
+            else
+                r_colored="\e[1;33mDISCONNECTED\e[0m"
+            fi
+            local r_ssid_disp="${REMOTE_WIFI_SSID:-none}"
+            if [[ "${r_status}" == "CONNECTED" && -n "${REMOTE_WIFI_BAND:-}" ]]; then
+                r_ssid_disp="${r_ssid_disp} (${REMOTE_WIFI_BAND})"
+            fi
+            printf '%-19s %-20s \e[1;36m%-10s\e[0m %-22s %-24s %-15s %-14s %b\n' \
+                "[Remote] ${REMOTE_CLIENT_HOST}" "Distributed Wi-Fi" "PHYSICAL" "OTA Hardware (SSH)" "${r_ssid_disp}" "${REMOTE_WIFI_IP:--}" "${REMOTE_WIFI_GATEWAY:--}" "${r_colored}"
+        fi
+    fi
+
     # --- Namespace Rows ---
     for entry in "${all_endpoints[@]}"; do
         local ns role type veth_h target_ssid band is_wifi
@@ -249,7 +271,43 @@ print_namespaces_section() {
         done
     fi
 
-    # 4.2 Namespaces Details
+    # 4.2 Remote Client Station Details (if configured)
+    if [[ -n "${REMOTE_CLIENT_HOST:-}" ]] && [[ -x "${SCRIPT_DIR}/remote_client.sh" ]]; then
+        local r_env
+        r_env="$("${SCRIPT_DIR}/remote_client.sh" wifi-env --check-ping "${DUT_LAN_IP:-192.168.1.1}" 2>/dev/null || true)"
+        if [[ -n "${r_env}" ]]; then
+            eval "${r_env}"
+            local r_status="${REMOTE_WIFI_STATUS:-DISCONNECTED}"
+            local r_status_colored
+            if [[ "${r_status}" == "CONNECTED" ]]; then
+                r_status_colored="\e[1;32mCONNECTED\e[0m"
+            else
+                r_status_colored="\e[1;33mDISCONNECTED\e[0m"
+            fi
+
+            printf '  • \e[1;36m[Remote Station] %s\e[0m (%s)\n' "${REMOTE_CLIENT_HOST}" "${REMOTE_WIFI_IF:-wlan0}"
+            printf '    - Connection Type : \e[1;36mDISTRIBUTED PHYSICAL\e[0m (Secondary Wi-Fi Client via SSH)\n'
+            printf '    - Connection State: %b\n' "${r_status_colored}"
+            if [[ "${r_status}" == "CONNECTED" ]]; then
+                printf '    - Connected SSID  : \e[1;35m%s\e[0m (BSSID: %s)\n' "${REMOTE_WIFI_SSID:-none}" "${REMOTE_WIFI_BSSID:-N/A}"
+                printf '    - RF Parameters   : Frequency: %s | Band: %s | Channel: %s | Width: %s\n' "${REMOTE_WIFI_BAND:-N/A}" "${REMOTE_WIFI_BAND:-N/A}" "${REMOTE_WIFI_CHANNEL:-N/A}" "${REMOTE_WIFI_WIDTH:-N/A}"
+                printf '    - Signal & Bitrate: Signal: %s | TX Bitrate: %s\n' "${REMOTE_WIFI_SIGNAL:-N/A}" "${REMOTE_WIFI_BITRATE:-N/A}"
+                printf '    - IP / Gateway    : IPv4: %s | Gateway: %s\n' "${REMOTE_WIFI_IP:-none}" "${REMOTE_WIFI_GATEWAY:-none}"
+                if [[ "${REMOTE_WIFI_PING_OK:-0}" == "1" ]]; then
+                    printf '    - DUT Reachability: \e[1;32mREACHABLE\e[0m (Ping RTT: %s)\n' "${REMOTE_WIFI_PING_RTT:-<1ms}"
+                else
+                    printf '    - DUT Reachability: \e[1;31mFAILED\e[0m (Cannot ping gateway %s)\n' "${DUT_LAN_IP:-192.168.1.1}"
+                fi
+            else
+                printf '    - Connected SSID  : \e[1;33m(None / Unassociated)\e[0m\n'
+                printf '    - Target DUT SSID : %s\n' "${DUT_SSID_2G:-U+NetF254}"
+                printf '    - Action to Link  : Run \e[1;36m./scripts/remote_client.sh wifi-connect 2g\e[0m\n'
+            fi
+            printf '    - Test Allocation : Remote Phone 2 for VoIP QoS (TC-QOS-01) / 3-way concurrent station\n'
+        fi
+    fi
+
+    # 4.3 Namespaces Details
     if is_root; then
         for entry in "${all_endpoints[@]}"; do
             local ns role type veth_h target_ssid band is_wifi

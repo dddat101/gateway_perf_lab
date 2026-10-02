@@ -130,10 +130,13 @@ def scan_wifi_devices() -> List[Dict[str, Any]]:
                     "mac": "",
                     "ssid": "",
                     "bssid": "",
+                    "status": "disconnected",
                     "channel": None,
                     "frequency_mhz": None,
                     "channel_width": "",
                     "txpower_dbm": None,
+                    "signal_dbm": "",
+                    "tx_bitrate": "",
                     "current_band": "Not Connected",
                     "is_mld": False,
                     "mld_link_addr": "",
@@ -177,31 +180,47 @@ def scan_wifi_devices() -> List[Dict[str, Any]]:
                 if m_pwr:
                     current_dev["txpower_dbm"] = float(m_pwr.group(1))
 
-    # Enrich each device with supported bands and IP information
+    # Enrich each device with supported bands, link details, and IP information
     for dev in devices:
         dev["supported_bands"] = inspect_phy_supported_bands(dev["phy"])
         dev["ip_info"] = get_interface_ip_info(dev["interface"])
 
-        # If SSID was not in iw dev output, query iw dev <iface> link
-        if not dev.get("ssid"):
-            rc_l, out_l, _ = run_cmd(["iw", "dev", dev["interface"], "link"])
-            if rc_l == 0:
-                for l_line in out_l.splitlines():
-                    l_s = l_line.strip()
-                    if "SSID:" in l_s:
-                        dev["ssid"] = l_s.split("SSID:", 1)[1].strip()
-                    elif "freq:" in l_s:
-                        try:
-                            f_val = float(l_s.split("freq:", 1)[1].strip())
-                            dev["frequency_mhz"] = int(f_val)
-                            if 2400 <= f_val <= 2500:
-                                dev["current_band"] = "2.4GHz"
-                            elif 5150 <= f_val <= 5895:
-                                dev["current_band"] = "5GHz"
-                            elif 5925 <= f_val <= 7125:
-                                dev["current_band"] = "6GHz"
-                        except Exception:
-                            pass
+        rc_l, out_l, _ = run_cmd(["iw", "dev", dev["interface"], "link"])
+        if rc_l == 0:
+            for l_line in out_l.splitlines():
+                l_s = l_line.strip()
+                if l_s.startswith("Connected to"):
+                    dev["status"] = "connected"
+                    parts = l_s.split()
+                    if len(parts) >= 3:
+                        dev["bssid"] = parts[2]
+                elif "SSID:" in l_s and not dev.get("ssid"):
+                    dev["ssid"] = l_s.split("SSID:", 1)[1].strip()
+                    dev["status"] = "connected"
+                elif "signal:" in l_s:
+                    m_sig = re.search(r"signal:\s*(-?\d+\s*dBm)", l_s)
+                    if m_sig:
+                        dev["signal_dbm"] = m_sig.group(1).strip()
+                elif "tx bitrate:" in l_s:
+                    dev["tx_bitrate"] = l_s.split("tx bitrate:", 1)[1].strip()
+                elif "freq:" in l_s and not dev.get("frequency_mhz"):
+                    try:
+                        f_val = float(l_s.split("freq:", 1)[1].strip())
+                        dev["frequency_mhz"] = int(f_val)
+                        if 2400 <= f_val <= 2500:
+                            dev["current_band"] = "2.4GHz"
+                        elif 5150 <= f_val <= 5895:
+                            dev["current_band"] = "5GHz"
+                        elif 5925 <= f_val <= 7125:
+                            dev["current_band"] = "6GHz"
+                    except Exception:
+                        pass
+
+        if dev.get("ssid"):
+            dev["status"] = "connected"
+        else:
+            dev["current_band"] = "Not Connected"
+            dev["status"] = "disconnected"
 
     return devices
 
@@ -290,20 +309,20 @@ def cmd_table(args: argparse.Namespace) -> int:
         print("=" * 78)
         return 0
 
-    print(f"{'Interface':<12} {'Phy':<8} {'Hardware Bands':<18} {'Connected SSID':<16} {'Active Band':<12} {'IP Address':<15}")
+    print(f"{'Interface':<10} {'Status':<12} {'SSID':<16} {'Band / Freq':<16} {'Signal':<10} {'IP Address':<15}")
     print("-" * 78)
 
     for d in devices:
         iface = d["interface"]
-        phy = d["phy"]
-        bands = ",".join(d["supported_bands"]) or "Unknown"
+        status = d.get("status", "disconnected").upper()
         ssid = d["ssid"] or "(disconnected)"
         active_b = d["current_band"]
         if d.get("channel"):
             active_b = f"{d['current_band']} (Ch {d['channel']})"
+        sig = d.get("signal_dbm", "") or "N/A"
         ip = d.get("ip_info", {}).get("ipv4", "none")
 
-        print(f"{iface:<12} {phy:<8} {bands:<18} {ssid:<16} {active_b:<12} {ip:<15}")
+        print(f"{iface:<10} {status:<12} {ssid:<16} {active_b:<16} {sig:<10} {ip:<15}")
 
     print("=" * 78)
     print(f"  Adaptive Recommendation : {rec['mode'].upper()}")
@@ -318,31 +337,109 @@ def cmd_export_env(args: argparse.Namespace) -> int:
     devices = scan_wifi_devices()
     rec = recommend_test_strategy(devices)
 
+    prefix = getattr(args, "prefix", "") or ""
+    check_ping = getattr(args, "check_ping", "") or ""
+
     count = len(devices)
-    print(f'WIFI_CARD_COUNT="{count}"')
-    print(f'WIFI_RECOMMENDED_MODE="{rec["mode"]}"')
+    if not prefix:
+        print(f'WIFI_CARD_COUNT="{count}"')
+        print(f'WIFI_RECOMMENDED_MODE="{rec["mode"]}"')
+    else:
+        print(f'{prefix}WIFI_CARD_COUNT="{count}"')
+        print(f'{prefix}WIFI_RECOMMENDED_MODE="{rec["mode"]}"')
 
     if devices:
         first = devices[0]
-        print(f'DETECTED_WIFI_IF="{first["interface"]}"')
-        print(f'DETECTED_WIFI_PHY="{first["phy"]}"')
-        print(f'DETECTED_WIFI_MAC="{first["mac"]}"')
-        print(f'DETECTED_WIFI_SSID="{first["ssid"]}"')
-        print(f'DETECTED_WIFI_BAND="{first["current_band"]}"')
-        print(f'DETECTED_WIFI_SUPPORTED_BANDS="{",".join(first["supported_bands"])}"')
-        print(f'DETECTED_WIFI_IP="{first.get("ip_info", {}).get("ipv4", "")}"')
-        print(f'DETECTED_WIFI_GATEWAY="{first.get("ip_info", {}).get("gateway", "")}"')
-        print(f'DETECTED_WIFI_IS_MLD="{1 if first["is_mld"] else 0}"')
+        ping_ok = 0
+        ping_rtt = ""
+        if check_ping and first.get("status") == "connected" and first.get("ip_info", {}).get("ipv4"):
+            rc_p, out_p, _ = run_cmd(["ping", "-c", "1", "-W", "1", "-I", first["interface"], check_ping])
+            if rc_p == 0:
+                ping_ok = 1
+                m_rtt = re.search(r"time=([\d.]+)\s*ms", out_p)
+                if m_rtt:
+                    ping_rtt = f"{m_rtt.group(1)} ms"
+
+        if not prefix:
+            # Default backward-compatible format
+            print(f'DETECTED_WIFI_STATUS="{first.get("status", "disconnected").upper()}"')
+            print(f'DETECTED_WIFI_IF="{first["interface"]}"')
+            print(f'DETECTED_WIFI_PHY="{first["phy"]}"')
+            print(f'DETECTED_WIFI_MAC="{first["mac"]}"')
+            print(f'DETECTED_WIFI_SSID="{first["ssid"]}"')
+            print(f'DETECTED_WIFI_BSSID="{first.get("bssid", "")}"')
+            print(f'DETECTED_WIFI_BAND="{first["current_band"]}"')
+            print(f'DETECTED_WIFI_CHANNEL="{first.get("channel") or ""}"')
+            print(f'DETECTED_WIFI_WIDTH="{first.get("channel_width", "")}"')
+            print(f'DETECTED_WIFI_SIGNAL="{first.get("signal_dbm", "")}"')
+            print(f'DETECTED_WIFI_BITRATE="{first.get("tx_bitrate", "")}"')
+            print(f'DETECTED_WIFI_SUPPORTED_BANDS="{",".join(first["supported_bands"])}"')
+            print(f'DETECTED_WIFI_IP="{first.get("ip_info", {}).get("ipv4", "")}"')
+            print(f'DETECTED_WIFI_GATEWAY="{first.get("ip_info", {}).get("gateway", "")}"')
+            print(f'DETECTED_WIFI_IS_MLD="{1 if first["is_mld"] else 0}"')
+            if check_ping:
+                print(f'DETECTED_WIFI_PING_OK="{ping_ok}"')
+                print(f'DETECTED_WIFI_PING_RTT="{ping_rtt}"')
+        else:
+            p = prefix
+            print(f'{p}WIFI_STATUS="{first.get("status", "disconnected").upper()}"')
+            print(f'{p}WIFI_IF="{first["interface"]}"')
+            print(f'{p}WIFI_PHY="{first["phy"]}"')
+            print(f'{p}WIFI_MAC="{first["mac"]}"')
+            print(f'{p}WIFI_SSID="{first["ssid"]}"')
+            print(f'{p}WIFI_BSSID="{first.get("bssid", "")}"')
+            print(f'{p}WIFI_BAND="{first["current_band"]}"')
+            print(f'{p}WIFI_CHANNEL="{first.get("channel") or ""}"')
+            print(f'{p}WIFI_WIDTH="{first.get("channel_width", "")}"')
+            print(f'{p}WIFI_SIGNAL="{first.get("signal_dbm", "")}"')
+            print(f'{p}WIFI_BITRATE="{first.get("tx_bitrate", "")}"')
+            print(f'{p}WIFI_SUPPORTED_BANDS="{",".join(first["supported_bands"])}"')
+            print(f'{p}WIFI_IP="{first.get("ip_info", {}).get("ipv4", "")}"')
+            print(f'{p}WIFI_GATEWAY="{first.get("ip_info", {}).get("gateway", "")}"')
+            print(f'{p}WIFI_IS_MLD="{1 if first["is_mld"] else 0}"')
+            if check_ping:
+                print(f'{p}WIFI_PING_OK="{ping_ok}"')
+                print(f'{p}WIFI_PING_RTT="{ping_rtt}"')
     else:
-        print('DETECTED_WIFI_IF=""')
-        print('DETECTED_WIFI_PHY=""')
-        print('DETECTED_WIFI_MAC=""')
-        print('DETECTED_WIFI_SSID=""')
-        print('DETECTED_WIFI_BAND=""')
-        print('DETECTED_WIFI_SUPPORTED_BANDS=""')
-        print('DETECTED_WIFI_IP=""')
-        print('DETECTED_WIFI_GATEWAY=""')
-        print('DETECTED_WIFI_IS_MLD="0"')
+        if not prefix:
+            print('DETECTED_WIFI_STATUS="DISCONNECTED"')
+            print('DETECTED_WIFI_IF=""')
+            print('DETECTED_WIFI_PHY=""')
+            print('DETECTED_WIFI_MAC=""')
+            print('DETECTED_WIFI_SSID=""')
+            print('DETECTED_WIFI_BSSID=""')
+            print('DETECTED_WIFI_BAND=""')
+            print('DETECTED_WIFI_CHANNEL=""')
+            print('DETECTED_WIFI_WIDTH=""')
+            print('DETECTED_WIFI_SIGNAL=""')
+            print('DETECTED_WIFI_BITRATE=""')
+            print('DETECTED_WIFI_SUPPORTED_BANDS=""')
+            print('DETECTED_WIFI_IP=""')
+            print('DETECTED_WIFI_GATEWAY=""')
+            print('DETECTED_WIFI_IS_MLD="0"')
+            if check_ping:
+                print('DETECTED_WIFI_PING_OK="0"')
+                print('DETECTED_WIFI_PING_RTT=""')
+        else:
+            p = prefix
+            print(f'{p}WIFI_STATUS="DISCONNECTED"')
+            print(f'{p}WIFI_IF=""')
+            print(f'{p}WIFI_PHY=""')
+            print(f'{p}WIFI_MAC=""')
+            print(f'{p}WIFI_SSID=""')
+            print(f'{p}WIFI_BSSID=""')
+            print(f'{p}WIFI_BAND=""')
+            print(f'{p}WIFI_CHANNEL=""')
+            print(f'{p}WIFI_WIDTH=""')
+            print(f'{p}WIFI_SIGNAL=""')
+            print(f'{p}WIFI_BITRATE=""')
+            print(f'{p}WIFI_SUPPORTED_BANDS=""')
+            print(f'{p}WIFI_IP=""')
+            print(f'{p}WIFI_GATEWAY=""')
+            print(f'{p}WIFI_IS_MLD="0"')
+            if check_ping:
+                print(f'{p}WIFI_PING_OK="0"')
+                print(f'{p}WIFI_PING_RTT=""')
 
     return 0
 
@@ -360,6 +457,8 @@ def main() -> int:
     p_table.set_defaults(func=cmd_table)
 
     p_env = subparsers.add_parser("export-env", help="Export variables for shell scripts.")
+    p_env.add_argument("--prefix", default="", help="Prefix for exported shell variables (e.g. REMOTE_).")
+    p_env.add_argument("--check-ping", default="", help="Optional IP to verify ping reachability (e.g. 192.168.1.1).")
     p_env.set_defaults(func=cmd_export_env)
 
     args = parser.parse_args()
