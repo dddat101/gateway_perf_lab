@@ -1520,7 +1520,7 @@ run_phase_voice_qos() {
 
     if [[ "${eff_mode}" == "distributed" ]]; then
         local remote_alive
-        remote_alive="$("${SCRIPT_DIR}/remote_client.sh" exec "pgrep -f '(pjsua|sipp|voip_call_simulator)' >/dev/null && echo 1 || echo 0" 2>/dev/null | tr -d '\r\n ' || echo 0)"
+        remote_alive="$("${SCRIPT_DIR}/remote_client.sh" is-voip-running "phone-2" 2>/dev/null | tr -d '\r\n ' || echo 0)"
         if [[ "${remote_alive}" != "1" ]]; then
             log_error "Remote Phone 2 VoIP client terminated prematurely or failed during the test!"
             verified_calls=$(( verified_calls - 1 ))

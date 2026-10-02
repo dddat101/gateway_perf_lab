@@ -47,6 +47,7 @@ Commands:
   wifi-ip            Query and print remote PC active Wi-Fi IPv4 address.
   run-iperf [args]   Execute iperf3 client on remote PC towards WAN server.
   run-voip [opts]    Execute VoIP call client (pjsua, sipp, python) on remote PC.
+  is-voip-running    Check if remote VoIP client process is currently alive (outputs 1 or 0).
   exec <cmd...>      Run an arbitrary command in remote lab directory.
   clean, stop        Terminate lingering test tasks (iperf3, voip, tcpdump) on remote.
 
@@ -442,6 +443,9 @@ cmd_run_voip() {
 
     local spawned_pid
     spawned_pid="$(remote_ssh_exec "${remote_cmd}" 2>/dev/null | tr -d '\r\n ' || true)"
+    if [[ -n "${spawned_pid}" && "${spawned_pid}" =~ ^[0-9]+$ ]]; then
+        remote_ssh_raw "echo ${spawned_pid} > /tmp/voip_${phone_id}.pid"
+    fi
 
     # Verify process actually started and is running
     local is_alive=0
@@ -464,6 +468,30 @@ cmd_run_voip() {
     fi
 }
 
+cmd_is_voip_running() {
+    local phone_id="${1:-phone-2}"
+    local check_cmd
+    read -r -d '' check_cmd <<'EOF' || true
+pid=""
+if [[ -f "/tmp/voip_phone-2.pid" ]]; then
+    pid="$(cat /tmp/voip_phone-2.pid 2>/dev/null | tr -d '[:space:]')"
+fi
+if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
+    echo 1
+    exit 0
+fi
+if pgrep -x sipp >/dev/null 2>&1 || pgrep -x pjsua >/dev/null 2>&1 || pgrep -f "[v]oip_call_simulator" >/dev/null 2>&1; then
+    echo 1
+    exit 0
+fi
+echo 0
+EOF
+    if [[ "${phone_id}" != "phone-2" ]]; then
+        check_cmd="${check_cmd//phone-2/${phone_id}}"
+    fi
+    remote_ssh_raw "${check_cmd}" | tr -d '\r\n '
+}
+
 cmd_clean() {
     print_header "CLEANING LINGERING PROCESSES ON REMOTE CLIENT"
     log_info "Target Endpoint: ${TARGET_USER}@${TARGET_HOST}"
@@ -482,6 +510,7 @@ cmd_clean() {
         done
         pkill -KILL -f "[t]raffic_generator.py" 2>/dev/null || true
         pkill -KILL -f "[v]oip_call_simulator.py" 2>/dev/null || true
+        rm -f /tmp/voip_*.pid 2>/dev/null || true
         sudo -n ip route del "'"${wan_ip}"'" 2>/dev/null || true
         sudo -n iptables -t mangle -D POSTROUTING -p udp -m multiport --dports 5060,5062,5064,10000,10002,10004 -j DSCP --set-dscp 46 2>/dev/null || true
         echo "Remote processes cleaned."
@@ -588,6 +617,14 @@ main() {
                 extra_args+=("$@")
                 break
                 ;;
+            is-voip-running|is-alive|check-voip)
+                action="is-voip-running"
+                shift
+                if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+                    extra_args+=("$1")
+                    shift
+                fi
+                ;;
             clean|stop)
                 action="clean"
                 shift
@@ -633,6 +670,9 @@ main() {
             ;;
         run-voip)
             cmd_run_voip "${extra_args[@]}"
+            ;;
+        is-voip-running)
+            cmd_is_voip_running "${extra_args[@]:-}"
             ;;
         clean)
             cmd_clean
