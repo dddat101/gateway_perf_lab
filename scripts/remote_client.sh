@@ -48,11 +48,22 @@ Commands:
   run-iperf [args]   Execute iperf3 client on remote PC towards WAN server.
   run-voip [opts]    Execute VoIP call client (pjsua, sipp, python) on remote PC.
   is-voip-running    Check if remote VoIP client process is currently alive (outputs 1 or 0).
+  run-vod [opts]     Execute VOD video client on remote PC.
+  run-wireless-qos   Execute concurrent Voice & Video QoS clients on remote PC.
+  is-wireless-qos-running Check if remote Wireless QoS clients are alive.
+  stop-wireless-qos  Stop remote Wireless QoS client processes.
   start-capture [if] Start background packet capture on remote PC.
   stop-capture [pcap]Stop remote background packet capture.
+  start-ota-monitor [opts] Put remote Wi-Fi card into 802.11 monitor mode (mon0)
+                     and start over-the-air packet capture (DLT_IEEE802_11_RADIO).
+  stop-ota-monitor [opts]  Stop OTA monitor capture, restore managed Wi-Fi mode,
+                     and optionally fetch capture locally (--fetch).
+  status-ota-monitor Query remote OTA monitor interface and capture state.
+  audit-ota-wmm [opts] Perform standalone over-the-air WMM EDCA audit
+                     (captures OTA beacon/probe frames on remote sniffer and parses EDCA).
   fetch-capture <rem>Download capture file from remote PC to local path.
   exec <cmd...>      Run an arbitrary command in remote lab directory.
-  clean, stop        Terminate lingering test tasks (iperf3, voip, tcpdump) on remote.
+  clean, stop        Terminate lingering test tasks (iperf3, voip, vod, tcpdump) on remote.
 
 Options:
   -H, --host <host>  Remote PC hostname or IP address (overrides config.env).
@@ -60,6 +71,14 @@ Options:
   -p, --port <port>  SSH port (default: 22).
   -i, --key <path>   Path to SSH private key.
   -d, --dir <path>   Absolute path to lab directory on remote PC.
+  --freq <mhz>       Operating frequency in MHz for OTA monitor (e.g. 5180, 5745).
+  --channel <ch>     Operating Wi-Fi channel for OTA monitor (e.g. 36, 149, 11).
+  --width <20|40|80> Channel bandwidth in MHz for OTA monitor (default: 40).
+  --center-freq <mhz>Center frequency for HT40/VHT80 monitor sniffing.
+  --mon-if <iface>   Monitor virtual interface name (default: mon0).
+  --bpf <filter>     BPF filter for remote tcpdump capture.
+  --bssid <mac>      Target BSSID MAC filter for OTA capture.
+  --fetch [dst]      Fetch remote capture to local destination upon stop.
   --with-config      Also sync local config.env during 'sync' command.
   -s, --silent       Suppress non-essential progress logging.
   -h, --help         Show this help message and exit.
@@ -69,6 +88,9 @@ Examples:
   ./scripts/remote_client.sh sync --with-config
   ./scripts/remote_client.sh status
   ./scripts/remote_client.sh wifi-connect 2g
+  ./scripts/remote_client.sh start-ota-monitor --channel 36 --width 40
+  ./scripts/remote_client.sh stop-ota-monitor --fetch ./captures/remote_ota_5g.pcap
+  ./scripts/remote_client.sh status-ota-monitor
   ./scripts/remote_client.sh run-iperf -c 10.10.0.1 -p 5202 -t 5
   ./scripts/remote_client.sh exec uname -a
 ==================================================================
@@ -337,15 +359,36 @@ cmd_run_iperf() {
         iperf_args=("-c" "${WAN_SERVER_IP:-10.10.0.1}" "-p" "5202" "-t" "5")
     fi
 
-    # Ensure remote host routes traffic for WAN server through Wi-Fi interface (DUT)
-    local env_dump
-    env_dump="$(cmd_get_wifi_env 2>/dev/null || true)"
-    eval "${env_dump}"
-    local remote_wifi_if="${REMOTE_WIFI_IF:-}"
-    local remote_gw="${REMOTE_WIFI_GATEWAY:-${DUT_LAN_IP:-192.168.1.1}}"
+    # Detect if a specific interface was requested via --bind-dev or -B
+    local target_dev=""
+    for (( i=0; i<${#iperf_args[@]}; i++ )); do
+        if [[ "${iperf_args[i]}" == "--bind-dev" && $(( i + 1 )) -lt ${#iperf_args[@]} ]]; then
+            target_dev="${iperf_args[i+1]}"
+            break
+        elif [[ "${iperf_args[i]}" =~ %([a-zA-Z0-9._-]+)$ ]]; then
+            target_dev="${BASH_REMATCH[1]}"
+            break
+        fi
+    done
+
     local wan_ip="${WAN_SERVER_IP:-10.10.0.1}"
-    if [[ -n "${remote_wifi_if}" && -n "${remote_gw}" ]]; then
-        remote_ssh_raw "sudo -n ip route replace '${wan_ip}' via '${remote_gw}' dev '${remote_wifi_if}' 2>/dev/null || true"
+    local remote_gw="${DUT_LAN_IP:-192.168.1.1}"
+
+    if [[ -z "${target_dev}" ]]; then
+        if [[ "${REMOTE_CLIENT_ROLE:-}" == "lan_client" && -n "${REMOTE_CLIENT_LAN_IF:-${REMOTE_LAN_IF:-}}" ]]; then
+            target_dev="${REMOTE_CLIENT_LAN_IF:-${REMOTE_LAN_IF:-}}"
+        else
+            # Default fallback to Wi-Fi if no bind dev specified
+            local env_dump
+            env_dump="$(cmd_get_wifi_env 2>/dev/null || true)"
+            eval "${env_dump}"
+            target_dev="${REMOTE_WIFI_IF:-}"
+            remote_gw="${REMOTE_WIFI_GATEWAY:-${remote_gw}}"
+        fi
+    fi
+
+    if [[ -n "${target_dev}" && -n "${remote_gw}" ]]; then
+        remote_ssh_raw "sudo -n ip route replace '${wan_ip}' via '${remote_gw}' dev '${target_dev}' 2>/dev/null || true"
     fi
 
     # Join arguments with spaces to prevent IFS newline splitting
@@ -518,28 +561,181 @@ cmd_run_voip() {
 
 cmd_is_voip_running() {
     local phone_id="${1:-phone-2}"
-    local check_cmd
-    read -r -d '' check_cmd <<EOF || true
-pid=""
-if [[ -f "/tmp/voip_${phone_id}.pid" ]]; then
-    pid="\$(cat "/tmp/voip_${phone_id}.pid" 2>/dev/null | tr -d '[:space:]')"
-fi
-if [[ -n "\${pid}" && "\${pid}" =~ ^[0-9]+$ ]]; then
-    if kill -0 "\${pid}" 2>/dev/null || sudo -n kill -0 "\${pid}" 2>/dev/null; then
-        echo 1
-        exit 0
-    else
+    local check_cmd='
+        pid=""
+        pid_file="/tmp/voip_'"${phone_id}"'.pid"
+        if [[ -f "${pid_file}" ]]; then
+            pid="$(cat "${pid_file}" 2>/dev/null | tr -d "[:space:]")"
+        fi
+        if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]]; then
+            if kill -0 "${pid}" 2>/dev/null || sudo -n kill -0 "${pid}" 2>/dev/null; then
+                echo 1
+                exit 0
+            else
+                echo 0
+                exit 0
+            fi
+        fi
+        if pgrep -f "voip_'"${phone_id}"'" >/dev/null 2>&1; then
+            echo 1
+            exit 0
+        fi
         echo 0
-        exit 0
-    fi
-fi
-if pgrep -f "voip_${phone_id}" >/dev/null 2>&1; then
-    echo 1
-    exit 0
-fi
-echo 0
-EOF
+    '
     remote_ssh_raw "${check_cmd}" | tr -d '\r\n '
+}
+
+cmd_run_vod() {
+    local server_ip="${WAN_SERVER_IP:-10.10.0.1}"
+    local server_port=5005
+    local bind_port=5005
+    local duration=10
+    local dscp=34
+    local output_json="/tmp/wqos_vod.json"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --server-ip) server_ip="$2"; shift 2 ;;
+            --server-port) server_port="$2"; shift 2 ;;
+            --bind-port) bind_port="$2"; shift 2 ;;
+            --duration|-d) duration="$2"; shift 2 ;;
+            --dscp) dscp="$2"; shift 2 ;;
+            --output-json) output_json="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local env_dump
+    env_dump="$(cmd_get_wifi_env 2>/dev/null || true)"
+    eval "${env_dump}"
+    local remote_wifi_ip="${REMOTE_WIFI_IP:-}"
+    local remote_wifi_if="${REMOTE_WIFI_IF:-wlan0}"
+    local remote_gw="${REMOTE_WIFI_GATEWAY:-${DUT_LAN_IP:-192.168.1.1}}"
+
+    if [[ -n "${remote_wifi_if}" && -n "${remote_gw}" ]]; then
+        remote_ssh_raw "sudo -n ip route replace '${server_ip}' via '${remote_gw}' dev '${remote_wifi_if}' 2>/dev/null || true"
+        remote_ssh_raw "sudo -n iptables -t mangle -C POSTROUTING -o '${remote_wifi_if}' -p udp --dport ${bind_port} -j DSCP --set-dscp ${dscp} 2>/dev/null || sudo -n iptables -t mangle -A POSTROUTING -o '${remote_wifi_if}' -p udp --dport ${bind_port} -j DSCP --set-dscp ${dscp} 2>/dev/null || true; sudo -n iptables -t mangle -C POSTROUTING -o '${remote_wifi_if}' -p udp --sport ${bind_port} -j DSCP --set-dscp ${dscp} 2>/dev/null || sudo -n iptables -t mangle -A POSTROUTING -o '${remote_wifi_if}' -p udp --sport ${bind_port} -j DSCP --set-dscp ${dscp} 2>/dev/null || true"
+    fi
+
+    local ip_opt=""
+    if [[ -n "${remote_wifi_ip}" ]]; then
+        ip_opt="--bind-ip ${remote_wifi_ip}"
+    fi
+
+    local env_prefix="export PATH=\"./tools/bin:\$PATH\"; export LD_LIBRARY_PATH=\"\${PWD}/tools/lib:\$LD_LIBRARY_PATH\";"
+    local remote_cmd="${env_prefix} nohup python3 tools/vod_stream_tester.py client --server-ip ${server_ip} --server-port ${server_port} --bind-port ${bind_port} ${ip_opt} --dscp ${dscp} --duration ${duration} --output-json ${output_json} > /tmp/wqos_vod.log 2>&1 < /dev/null & echo \$!"
+
+    local spawned_pid
+    spawned_pid="$(remote_ssh_exec "${remote_cmd}" 2>/dev/null | tr -d '\r\n ' || true)"
+    if [[ -n "${spawned_pid}" && "${spawned_pid}" =~ ^[0-9]+$ ]]; then
+        remote_ssh_raw "echo ${spawned_pid} > /tmp/wqos_vod.pid"
+        log_success "Remote VOD client active on ${TARGET_HOST} (PID: ${spawned_pid})."
+    else
+        log_error "Remote VOD client FAILED to start on ${TARGET_HOST}!"
+        return 1
+    fi
+}
+
+cmd_run_wireless_qos() {
+    local server_ip="${WAN_SERVER_IP:-10.10.0.1}"
+    local duration=10
+    local voice_dscp=46
+    local video_dscp=34
+    local voice_port=10000
+    local video_port=5005
+
+    # Never reuse metrics from an earlier invocation when a client fails to start.
+    remote_ssh_raw "rm -f /tmp/wqos_vod.json /tmp/wqos_voice.json"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --server-ip) server_ip="$2"; shift 2 ;;
+            --duration|-d) duration="$2"; shift 2 ;;
+            --voice-dscp) voice_dscp="$2"; shift 2 ;;
+            --video-dscp) video_dscp="$2"; shift 2 ;;
+            --voice-port) voice_port="$2"; shift 2 ;;
+            --video-port) video_port="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    # Probe remote Wi-Fi status & IP
+    local env_dump
+    env_dump="$(cmd_get_wifi_env 2>/dev/null || true)"
+    eval "${env_dump}"
+    local remote_wifi_ip="${REMOTE_WIFI_IP:-}"
+    local remote_wifi_if="${REMOTE_WIFI_IF:-wlan0}"
+    local remote_gw="${REMOTE_WIFI_GATEWAY:-${DUT_LAN_IP:-192.168.1.1}}"
+
+    if [[ -z "${remote_wifi_ip}" ]]; then
+        log_error "No active Wi-Fi IP detected on remote PC ${TARGET_HOST}!"
+        return 1
+    fi
+
+    # Ensure remote host routes traffic for server_ip via Wi-Fi interface (DUT)
+    if [[ -n "${remote_wifi_if}" && -n "${remote_gw}" ]]; then
+        remote_ssh_raw "sudo -n ip route replace '${server_ip}' via '${remote_gw}' dev '${remote_wifi_if}' 2>/dev/null || true"
+        # Mangle rules for Voice (DSCP 46) and Video (DSCP 34)
+        remote_ssh_raw "sudo -n iptables -t mangle -C POSTROUTING -o '${remote_wifi_if}' -p udp --dport ${voice_port} -j DSCP --set-dscp ${voice_dscp} 2>/dev/null || sudo -n iptables -t mangle -A POSTROUTING -o '${remote_wifi_if}' -p udp --dport ${voice_port} -j DSCP --set-dscp ${voice_dscp} 2>/dev/null || true; sudo -n iptables -t mangle -C POSTROUTING -o '${remote_wifi_if}' -p udp --sport ${voice_port} -j DSCP --set-dscp ${voice_dscp} 2>/dev/null || sudo -n iptables -t mangle -A POSTROUTING -o '${remote_wifi_if}' -p udp --sport ${voice_port} -j DSCP --set-dscp ${voice_dscp} 2>/dev/null || true"
+        remote_ssh_raw "sudo -n iptables -t mangle -C POSTROUTING -o '${remote_wifi_if}' -p udp --dport ${video_port} -j DSCP --set-dscp ${video_dscp} 2>/dev/null || sudo -n iptables -t mangle -A POSTROUTING -o '${remote_wifi_if}' -p udp --dport ${video_port} -j DSCP --set-dscp ${video_dscp} 2>/dev/null || true; sudo -n iptables -t mangle -C POSTROUTING -o '${remote_wifi_if}' -p udp --sport ${video_port} -j DSCP --set-dscp ${video_dscp} 2>/dev/null || sudo -n iptables -t mangle -A POSTROUTING -o '${remote_wifi_if}' -p udp --sport ${video_port} -j DSCP --set-dscp ${video_dscp} 2>/dev/null || true"
+    fi
+
+    local env_prefix="export PATH=\"./tools/bin:\$PATH\"; export LD_LIBRARY_PATH=\"\${PWD}/tools/lib:\$LD_LIBRARY_PATH\";"
+
+    # Start VOD Client
+    local vod_cmd="${env_prefix} nohup python3 tools/vod_stream_tester.py client --server-ip ${server_ip} --server-port ${video_port} --bind-ip ${remote_wifi_ip} --bind-port ${video_port} --dscp ${video_dscp} --duration ${duration} --min-throughput-mbps 0 --max-loss-pct 1.0 --output-json /tmp/wqos_vod.json > /tmp/wqos_vod.log 2>&1 < /dev/null & echo \$!"
+    local vod_pid
+    vod_pid="$(remote_ssh_exec "${vod_cmd}" 2>/dev/null | tr -d '\r\n ' || true)"
+    if [[ -n "${vod_pid}" && "${vod_pid}" =~ ^[0-9]+$ ]]; then
+        remote_ssh_raw "echo ${vod_pid} > /tmp/wqos_vod.pid"
+    fi
+
+    # Start Voice Client
+    local voice_cmd="${env_prefix} nohup python3 tools/voip_call_simulator.py client --server-ip ${server_ip} --server-port ${voice_port} --bind-ip ${remote_wifi_ip} --bind-port ${voice_port} --dscp ${voice_dscp} --duration ${duration} --phone-id wqos-voice --output-json /tmp/wqos_voice.json > /tmp/wqos_voice.log 2>&1 < /dev/null & echo \$!"
+    local voice_pid
+    voice_pid="$(remote_ssh_exec "${voice_cmd}" 2>/dev/null | tr -d '\r\n ' || true)"
+    if [[ -n "${voice_pid}" && "${voice_pid}" =~ ^[0-9]+$ ]]; then
+        remote_ssh_raw "echo ${voice_pid} > /tmp/wqos_voice.pid"
+    fi
+
+    log_success "Remote Wireless QoS clients launched on ${TARGET_HOST} (VOD PID: ${vod_pid:-fail}, Voice PID: ${voice_pid:-fail})."
+}
+
+cmd_is_wireless_qos_running() {
+    local check_cmd='
+        alive=0
+        for svc in vod voice; do
+            if [[ -f "/tmp/wqos_${svc}.pid" ]]; then
+                pid="$(cat "/tmp/wqos_${svc}.pid" 2>/dev/null | tr -d "[:space:]")"
+                if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]]; then
+                    if kill -0 "${pid}" 2>/dev/null || sudo -n kill -0 "${pid}" 2>/dev/null; then
+                        alive=$(( alive + 1 ))
+                    fi
+                fi
+            fi
+        done
+        echo "${alive}"
+    '
+    remote_ssh_raw "${check_cmd}" | tr -d '\r\n '
+}
+
+cmd_stop_wireless_qos() {
+    local stop_script='
+        for svc in vod voice; do
+            if [[ -f "/tmp/wqos_${svc}.pid" ]]; then
+                pid="$(cat "/tmp/wqos_${svc}.pid" 2>/dev/null | tr -d "[:space:]")"
+                if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]]; then
+                    kill -TERM "${pid}" 2>/dev/null || sudo -n kill -TERM "${pid}" 2>/dev/null || true
+                    sleep 0.1
+                    kill -KILL "${pid}" 2>/dev/null || sudo -n kill -KILL "${pid}" 2>/dev/null || true
+                fi
+                rm -f "/tmp/wqos_${svc}.pid" 2>/dev/null || true
+            fi
+        done
+        pkill -TERM -f "[v]od_stream_tester.py" 2>/dev/null || true
+        pkill -TERM -f "[v]oip_call_simulator.py" 2>/dev/null || true
+    '
+    remote_ssh_raw "${stop_script}"
 }
 
 cmd_clean() {
@@ -553,6 +749,7 @@ cmd_clean() {
         done
         pkill -TERM -f "[t]raffic_generator.py" 2>/dev/null || true
         pkill -TERM -f "[v]oip_call_simulator.py" 2>/dev/null || true
+        pkill -TERM -f "[v]od_stream_tester.py" 2>/dev/null || true
         pkill -TERM -f "[t]cpdump -i" 2>/dev/null || true
         sleep 0.2
         for proc in iperf3 pjsua sipp; do
@@ -560,10 +757,20 @@ cmd_clean() {
         done
         pkill -KILL -f "[t]raffic_generator.py" 2>/dev/null || true
         pkill -KILL -f "[v]oip_call_simulator.py" 2>/dev/null || true
-        rm -f /tmp/voip_*.pid /tmp/voip_*.log /tmp/sipp_uac_pcap*.xml 2>/dev/null || true
+        pkill -KILL -f "[v]od_stream_tester.py" 2>/dev/null || true
+        sudo -n pkill -KILL -f "[t]cpdump.*mon" 2>/dev/null || true
+        sudo -n ip link set mon0 down 2>/dev/null || true
+        sudo -n iw dev mon0 del 2>/dev/null || true
+        sudo -n ip link set wlp3s0 up 2>/dev/null || true
+        sudo -n nmcli dev set wlp3s0 managed yes 2>/dev/null || true
+        rm -f /tmp/voip_*.pid /tmp/voip_*.log /tmp/sipp_uac_pcap*.xml /tmp/wqos_*.pid /tmp/wqos_*.log /tmp/wqos_*.json /tmp/ota_*.pid /tmp/ota_*.state /tmp/ota_*.log 2>/dev/null || true
         sudo -n ip route del "'"${wan_ip}"'" 2>/dev/null || true
         sudo -n iptables -t mangle -D POSTROUTING -p udp -m multiport --dports 5060,5062,5064,10000,10002,10004 -j DSCP --set-dscp 46 2>/dev/null || true
         sudo -n iptables -t mangle -D POSTROUTING -p udp -m multiport --sports 5060,5062,5064,10000,10002,10004 -j DSCP --set-dscp 46 2>/dev/null || true
+        sudo -n iptables -t mangle -D POSTROUTING -p udp --dport 5005 -j DSCP --set-dscp 34 2>/dev/null || true
+        sudo -n iptables -t mangle -D POSTROUTING -p udp --sport 5005 -j DSCP --set-dscp 34 2>/dev/null || true
+        sudo -n iptables -t mangle -D POSTROUTING -p udp --dport 10000 -j DSCP --set-dscp 46 2>/dev/null || true
+        sudo -n iptables -t mangle -D POSTROUTING -p udp --sport 10000 -j DSCP --set-dscp 46 2>/dev/null || true
         echo "Remote processes cleaned."
     '
     remote_ssh_raw "${clean_script}"
@@ -573,45 +780,570 @@ cmd_clean() {
 cmd_start_capture() {
     local iface="${1:-wlp3s0}"
     local bpf_filter="${2:-udp port 5060 or udp port 5064 or udp port 10002}"
-    local pcap_path="${3:-/tmp/remote_voice.pcap}"
+    local pcap_path="${3:-captures/remote_wifi.pcap}"
     local snaplen="${4:-${CAPTURE_SNAPLEN:-96}}"
 
+    local target_pcap="${pcap_path}"
+    if [[ "${target_pcap}" != /* ]]; then
+        if [[ "${target_pcap}" != captures/* ]]; then
+            target_pcap="captures/${target_pcap}"
+        fi
+        target_pcap="${TARGET_DIR}/${target_pcap}"
+    fi
+
     remote_ssh_raw "
-        sudo -n pkill -KILL -f \"[t]cpdump.*${pcap_path}\" 2>/dev/null || true
-        sudo -n rm -f '${pcap_path}' 2>/dev/null || true
-        nohup sudo -n tcpdump -ni '${iface}' -s ${snaplen} -U -w '${pcap_path}' ${bpf_filter} >/dev/null 2>&1 < /dev/null &
+        mkdir -p \"\$(dirname '${target_pcap}')\" 2>/dev/null || true
+        chmod 0777 \"\$(dirname '${target_pcap}')\" 2>/dev/null || true
+        sudo -n pkill -KILL -f \"[t]cpdump.*${target_pcap}\" 2>/dev/null || true
+        sudo -n rm -f '${target_pcap}' 2>/dev/null || true
+        touch '${target_pcap}' 2>/dev/null || sudo -n touch '${target_pcap}' 2>/dev/null || true
+        chmod 0666 '${target_pcap}' 2>/dev/null || sudo -n chmod 0666 '${target_pcap}' 2>/dev/null || true
+        nohup sudo -n tcpdump -ni '${iface}' -s ${snaplen} -U -w '${target_pcap}' ${bpf_filter} >/dev/null 2>&1 < /dev/null &
     "
     sleep 0.4
     local is_alive
-    is_alive="$(remote_ssh_raw "sudo -n pgrep -f \"[t]cpdump.*${pcap_path}\" >/dev/null && echo 1 || echo 0" | tr -d '\r\n ')"
+    is_alive="$(remote_ssh_raw "sudo -n pgrep -f \"[t]cpdump.*${target_pcap}\" >/dev/null && echo 1 || echo 0" | tr -d '\r\n ')"
     if [[ "${is_alive}" == "1" ]]; then
-        log_success "Remote Wi-Fi capture active on ${TARGET_HOST}:${iface} -> ${pcap_path}"
+        log_success "Remote Wi-Fi capture active on ${TARGET_HOST}:${iface} -> ${target_pcap}"
     else
         log_warn "Failed to start remote Wi-Fi capture on ${TARGET_HOST}:${iface}"
     fi
 }
 
 cmd_stop_capture() {
-    local pcap_path="${1:-/tmp/remote_voice.pcap}"
+    local pcap_path="${1:-captures/remote_wifi.pcap}"
+    local target_pcap="${pcap_path}"
+    if [[ "${target_pcap}" != /* ]]; then
+        if [[ "${target_pcap}" != captures/* ]]; then
+            target_pcap="captures/${target_pcap}"
+        fi
+        target_pcap="${TARGET_DIR}/${target_pcap}"
+    fi
     remote_ssh_raw "
-        sudo -n pkill -TERM -f \"[t]cpdump.*${pcap_path}\" 2>/dev/null || true
+        sudo -n pkill -TERM -f \"[t]cpdump.*${target_pcap}\" 2>/dev/null || true
         sleep 0.2
-        sudo -n pkill -KILL -f \"[t]cpdump.*${pcap_path}\" 2>/dev/null || true
-        sudo -n chmod 0666 '${pcap_path}' 2>/dev/null || true
+        sudo -n pkill -KILL -f \"[t]cpdump.*${target_pcap}\" 2>/dev/null || true
+        sudo -n chmod 0666 '${target_pcap}' 2>/dev/null || true
     "
-    log_success "Remote Wi-Fi capture stopped: ${pcap_path}"
+    log_success "Remote Wi-Fi capture stopped: ${target_pcap}"
+}
+
+cmd_start_ota_monitor() {
+    local iface=""
+    local mon_if="mon0"
+    local freq=""
+    local channel=""
+    local band=""
+    local width="40"
+    local center_freq=""
+    local bpf_filter=""
+    local bssid=""
+    local pcap_path=""
+    local snaplen=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --iface|-i)
+                iface="$2"
+                shift 2
+                ;;
+            --mon-if|--mon-iface|-m)
+                mon_if="$2"
+                shift 2
+                ;;
+            --freq|-f)
+                freq="$2"
+                shift 2
+                ;;
+            --channel|-c)
+                channel="$2"
+                shift 2
+                ;;
+            --band|-b)
+                band="$2"
+                shift 2
+                ;;
+            --width|-w)
+                width="$2"
+                shift 2
+                ;;
+            --center-freq)
+                center_freq="$2"
+                shift 2
+                ;;
+            --bpf|--filter)
+                bpf_filter="$2"
+                shift 2
+                ;;
+            --bssid)
+                bssid="$2"
+                shift 2
+                ;;
+            --pcap)
+                pcap_path="$2"
+                shift 2
+                ;;
+            --snaplen|-s)
+                snaplen="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    # 1. Resolve remote physical Wi-Fi interface
+    if [[ -z "${iface}" ]]; then
+        iface="${REMOTE_CLIENT_WIFI_IF:-auto}"
+        if [[ "${iface}" == "auto" || -z "${iface}" ]]; then
+            iface="$(remote_ssh_raw 'iw dev 2>/dev/null | awk "/Interface/ && \$2 !~ /mon/ {print \$2; exit}"' | tr -d '\r\n ')"
+        fi
+    fi
+    if [[ -z "${iface}" ]]; then
+        iface="wlp3s0"
+    fi
+
+    # 2. Derive frequency from channel if specified
+    if [[ -n "${channel}" && -z "${freq}" ]]; then
+        if (( channel >= 1 && channel <= 14 )); then
+            if (( channel == 14 )); then
+                freq=2484
+            else
+                freq=$(( 2407 + channel * 5 ))
+            fi
+            if [[ -z "${center_freq}" && "${width}" == "20" ]]; then
+                center_freq="${freq}"
+            fi
+        elif (( channel >= 36 && channel <= 165 )); then
+            freq=$(( 5000 + channel * 5 ))
+        fi
+    fi
+
+    # 3. Auto-detect frequency and width from active remote Wi-Fi connection if not provided
+    if [[ -z "${freq}" ]]; then
+        local link_info
+        link_info="$(remote_ssh_raw "iw dev '${iface}' link 2>/dev/null || true")"
+        if [[ "${link_info}" =~ freq:[[:space:]]*([0-9]+) ]]; then
+            freq="${BASH_REMATCH[1]}"
+            local dev_info
+            dev_info="$(remote_ssh_raw "iw dev '${iface}' info 2>/dev/null || true")"
+            if [[ "${dev_info}" =~ width:[[:space:]]*([0-9]+)[[:space:]]*MHz ]]; then
+                width="${BASH_REMATCH[1]}"
+            fi
+            if [[ "${dev_info}" =~ center1:[[:space:]]*([0-9]+)[[:space:]]*MHz ]]; then
+                center_freq="${BASH_REMATCH[1]}"
+            fi
+        fi
+    fi
+
+    # Fallback default if still unassigned (default 5GHz Ch 36 40MHz)
+    if [[ -z "${freq}" ]]; then
+        freq="5180"
+        width="40"
+        center_freq="5190"
+    fi
+
+    # 4. Resolve center frequency for HT40 if not given
+    if [[ -z "${center_freq}" ]]; then
+        if [[ "${width}" == "20" ]]; then
+            center_freq="${freq}"
+        elif [[ "${width}" == "40" ]]; then
+            if (( freq >= 5180 && freq <= 5320 )) || (( freq >= 5500 && freq <= 5720 )); then
+                if (( (freq / 20) % 2 == 1 )); then
+                    center_freq=$(( freq + 10 ))
+                else
+                    center_freq=$(( freq - 10 ))
+                fi
+            elif (( freq == 5745 || freq == 5785 )); then
+                center_freq=$(( freq + 10 ))
+            elif (( freq == 5765 || freq == 5805 )); then
+                center_freq=$(( freq - 10 ))
+            elif (( freq >= 2412 && freq <= 2442 )); then
+                center_freq=$(( freq + 10 ))
+            elif (( freq >= 2447 && freq <= 2472 )); then
+                center_freq=$(( freq - 10 ))
+            else
+                center_freq="${freq}"
+            fi
+        fi
+    fi
+
+    # 5. Resolve BPF filter from BSSID if provided
+    if [[ -n "${bssid}" && -z "${bpf_filter}" ]]; then
+        bpf_filter="wlan addr1 ${bssid} or wlan addr2 ${bssid} or wlan addr3 ${bssid}"
+    fi
+
+    # 6. Resolve target pcap path
+    if [[ -z "${pcap_path}" ]]; then
+        local ts
+        ts="$(date +%Y%m%d_%H%M%S)"
+        pcap_path="captures/remote_ota_${ts}.pcap"
+    fi
+    local target_pcap="${pcap_path}"
+    if [[ "${target_pcap}" != /* ]]; then
+        if [[ "${target_pcap}" != captures/* && "${target_pcap}" != tmp/* ]]; then
+            target_pcap="captures/${target_pcap}"
+        fi
+        target_pcap="${TARGET_DIR}/${target_pcap}"
+    fi
+
+    print_header "STARTING REMOTE OTA MONITOR CAPTURE"
+    log_info "Target Endpoint  : ${TARGET_USER}@${TARGET_HOST}"
+    log_info "Base Interface   : ${iface}"
+    log_info "Monitor Dev      : ${mon_if}"
+    log_info "Tuning Target    : ${freq} MHz (Width: ${width} MHz${center_freq:+, Center: ${center_freq} MHz})"
+    log_info "Capture Dest     : ${target_pcap}"
+    if [[ -n "${bpf_filter}" ]]; then
+        log_info "BPF Filter       : ${bpf_filter}"
+    else
+        log_info "BPF Filter       : [None - Capture All 802.11 Frames]"
+    fi
+
+    # 7. Execute remote initialization and capture
+    local remote_start_cmd
+    remote_start_cmd="
+        mkdir -p \"\$(dirname '${target_pcap}')\" 2>/dev/null || true
+        chmod 0777 \"\$(dirname '${target_pcap}')\" 2>/dev/null || true
+
+        # Clean lingering monitor capture
+        sudo -n pkill -KILL -f \"[t]cpdump.*${mon_if}\" 2>/dev/null || true
+        if [[ -f /tmp/ota_capture.pid ]]; then
+            old_pid=\"\$(cat /tmp/ota_capture.pid 2>/dev/null | tr -d '[:space:]')\"
+            if [[ -n \"\${old_pid}\" ]]; then
+                sudo -n kill -KILL \"\${old_pid}\" 2>/dev/null || true
+            fi
+            rm -f /tmp/ota_capture.pid
+        fi
+
+        # Clean lingering monitor interface
+        sudo -n ip link set '${mon_if}' down 2>/dev/null || true
+        sudo -n iw dev '${mon_if}' del 2>/dev/null || true
+
+        # Save monitor state
+        {
+            echo "BASE_IFACE='${iface}'"
+            echo "MON_IFACE='${mon_if}'"
+            echo "FREQ='${freq}'"
+            echo "WIDTH='${width}'"
+            echo "CENTER_FREQ='${center_freq}'"
+            echo "PCAP_PATH='${target_pcap}'"
+        } > /tmp/ota_monitor.state
+
+        sudo -n nmcli dev set '${mon_if}' managed no 2>/dev/null || true
+        sudo -n ip link set '${iface}' down 2>/dev/null || true
+        sudo -n iw dev '${iface}' interface add '${mon_if}' type monitor
+        sudo -n ip link set '${mon_if}' up
+    "
+
+    if [[ -n "${center_freq}" && "${width}" != "20" ]]; then
+        remote_start_cmd+="
+        sudo -n iw dev '${mon_if}' set freq '${freq}' '${width}' '${center_freq}'
+        "
+    else
+        remote_start_cmd+="
+        sudo -n iw dev '${mon_if}' set freq '${freq}'
+        "
+    fi
+
+    remote_start_cmd+="
+        sudo -n rm -f '${target_pcap}' 2>/dev/null || true
+        touch '${target_pcap}' 2>/dev/null || sudo -n touch '${target_pcap}' 2>/dev/null || true
+        sudo -n chmod 0666 '${target_pcap}' 2>/dev/null || true
+
+        nohup sudo -n tcpdump -ni '${mon_if}' -s ${snaplen} -U -w '${target_pcap}' ${bpf_filter} > /tmp/ota_capture.log 2>&1 < /dev/null &
+        echo \$! > /tmp/ota_capture.pid
+    "
+
+    remote_ssh_raw "${remote_start_cmd}"
+    sleep 0.5
+
+    # 8. Verify running state
+    local is_alive
+    is_alive="$(remote_ssh_raw '
+        if [[ -f /tmp/ota_capture.pid ]]; then
+            pid="$(cat /tmp/ota_capture.pid 2>/dev/null | tr -d "[:space:]")"
+            if [[ -n "${pid}" ]] && sudo -n kill -0 "${pid}" 2>/dev/null; then
+                echo "1"
+            else
+                echo "0"
+            fi
+        else
+            echo "0"
+        fi
+    ' | tr -d '\r\n ')"
+
+    if [[ "${is_alive}" == "1" ]]; then
+        log_success "Remote OTA Monitor capture active on ${TARGET_HOST}:${mon_if} -> ${target_pcap}"
+        echo "${target_pcap}"
+        return 0
+    else
+        log_error "Failed to start remote OTA Monitor capture on ${TARGET_HOST}:${mon_if}!"
+        remote_ssh_raw "cat /tmp/ota_capture.log 2>/dev/null || true"
+        return 1
+    fi
+}
+
+cmd_stop_ota_monitor() {
+    local target_pcap=""
+    local do_fetch=0
+    local local_dst=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pcap)
+                target_pcap="$2"
+                shift 2
+                ;;
+            --fetch)
+                do_fetch=1
+                shift
+                if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+                    local_dst="$1"
+                    shift
+                fi
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    print_header "STOPPING REMOTE OTA MONITOR CAPTURE"
+    log_info "Target Endpoint: ${TARGET_USER}@${TARGET_HOST}"
+
+    local remote_stop_script='
+        # 1. Terminate tcpdump
+        if [[ -f /tmp/ota_capture.pid ]]; then
+            pid="$(cat /tmp/ota_capture.pid 2>/dev/null | tr -d "[:space:]")"
+            if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]]; then
+                sudo -n kill -TERM "${pid}" 2>/dev/null || true
+                sleep 0.2
+                sudo -n kill -KILL "${pid}" 2>/dev/null || true
+            fi
+            rm -f /tmp/ota_capture.pid 2>/dev/null || true
+        fi
+        sudo -n pkill -TERM -f "[t]cpdump.*mon" 2>/dev/null || true
+
+        # 2. Extract recorded state
+        if [[ -f /tmp/ota_monitor.state ]]; then
+            # shellcheck disable=SC1091
+            source /tmp/ota_monitor.state 2>/dev/null || true
+        fi
+        base_iface="${BASE_IFACE:-wlp3s0}"
+        mon_if="${MON_IFACE:-mon0}"
+        pcap_path="${PCAP_PATH:-'"${target_pcap}"'}"
+
+        # 3. Teardown monitor interface
+        sudo -n ip link set "${mon_if}" down 2>/dev/null || true
+        sudo -n iw dev "${mon_if}" del 2>/dev/null || true
+
+        # 4. Restore base Wi-Fi interface
+        sudo -n ip link set "${base_iface}" up 2>/dev/null || true
+        sudo -n nmcli dev set "${base_iface}" managed yes 2>/dev/null || true
+        sudo -n nmcli dev connect "${base_iface}" 2>/dev/null || true
+
+        # 5. Fix permissions and report
+        if [[ -n "${pcap_path}" && -f "${pcap_path}" ]]; then
+            sudo -n chmod 0666 "${pcap_path}" 2>/dev/null || true
+            size="$(ls -lh "${pcap_path}" 2>/dev/null | awk "{print \$5}")"
+            echo "STATUS:STOPPED:${pcap_path}:${size}"
+        else
+            echo "STATUS:STOPPED:${pcap_path}:0"
+        fi
+        rm -f /tmp/ota_monitor.state /tmp/ota_capture.log 2>/dev/null || true
+    '
+
+    local stop_result
+    stop_result="$(remote_ssh_raw "${remote_stop_script}")"
+    local reported_pcap=""
+    local reported_size="0"
+
+    while IFS= read -r line; do
+        if [[ "${line}" =~ ^STATUS:STOPPED:([^:]*):(.*)$ ]]; then
+            reported_pcap="${BASH_REMATCH[1]}"
+            reported_size="${BASH_REMATCH[2]}"
+            break
+        fi
+    done <<< "${stop_result}"
+
+    if [[ -z "${target_pcap}" ]]; then
+        target_pcap="${reported_pcap}"
+    fi
+
+    log_success "Remote OTA Monitor capture stopped: ${target_pcap} (Size: ${reported_size})"
+
+    if (( do_fetch == 1 )) && [[ -n "${target_pcap}" ]]; then
+        if [[ -z "${local_dst}" ]]; then
+            local_dst="./captures/$(basename "${target_pcap}")"
+        fi
+        cmd_fetch_capture "${target_pcap}" "${local_dst}"
+    fi
+}
+
+cmd_status_ota_monitor() {
+    print_header "REMOTE OTA MONITOR STATUS"
+    log_info "Target Endpoint: ${TARGET_USER}@${TARGET_HOST}"
+
+    local status_script='
+        state_file="/tmp/ota_monitor.state"
+        pid_file="/tmp/ota_capture.pid"
+        if [[ -f "${state_file}" ]]; then
+            source "${state_file}" 2>/dev/null || true
+        fi
+        mon_if="${MON_IFACE:-mon0}"
+        pcap_path="${PCAP_PATH:-}"
+
+        mon_exists=0
+        mon_freq=""
+        if iw dev "${mon_if}" info >/dev/null 2>&1; then
+            mon_exists=1
+            mon_freq="$(iw dev "${mon_if}" info 2>/dev/null | grep -E "channel" | tr -d "\t\r\n" || true)"
+        fi
+
+        is_running=0
+        pid=""
+        if [[ -f "${pid_file}" ]]; then
+            pid="$(cat "${pid_file}" 2>/dev/null | tr -d "[:space:]")"
+            if [[ -n "${pid}" ]] && sudo -n kill -0 "${pid}" 2>/dev/null; then
+                is_running=1
+            fi
+        fi
+
+        pcap_size="0"
+        if [[ -n "${pcap_path}" && -f "${pcap_path}" ]]; then
+            pcap_size="$(ls -lh "${pcap_path}" 2>/dev/null | awk "{print \$5}")"
+        fi
+
+        echo "STATUS_MON_EXISTS=\"${mon_exists}\""
+        echo "STATUS_MON_DEV=\"${mon_if}\""
+        echo "STATUS_MON_FREQ=\"${mon_freq}\""
+        echo "STATUS_IS_RUNNING=\"${is_running}\""
+        echo "STATUS_PID=\"${pid}\""
+        echo "STATUS_PCAP_PATH=\"${pcap_path}\""
+        echo "STATUS_PCAP_SIZE=\"${pcap_size}\""
+    '
+    local status_out
+    status_out="$(remote_ssh_raw "${status_script}")"
+    eval "${status_out}"
+
+    if [[ "${STATUS_MON_EXISTS:-0}" == "1" ]]; then
+        log_success "  -> Monitor Device : ${STATUS_MON_DEV:-mon0} [ACTIVE] (${STATUS_MON_FREQ:-unknown})"
+    else
+        log_info "  -> Monitor Device : ${STATUS_MON_DEV:-mon0} [INACTIVE]"
+    fi
+
+    if [[ "${STATUS_IS_RUNNING:-0}" == "1" ]]; then
+        log_success "  -> Capture Daemon : RUNNING (PID: ${STATUS_PID:-unknown})"
+        log_info    "  -> Capture File   : ${STATUS_PCAP_PATH:-none} (${STATUS_PCAP_SIZE:-0B})"
+    else
+        log_info    "  -> Capture Daemon : STOPPED"
+    fi
+    print_section "STATUS QUERY COMPLETE"
+}
+
+cmd_audit_ota_wmm() {
+    local duration=3
+    local freq=""
+    local channel=""
+    local width="40"
+    local bssid=""
+    local ap_edca_json="${LAB_DIR}/logs/ap_edca.json"
+    local out_pcap=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --duration|-d)
+                duration="$2"
+                shift 2
+                ;;
+            --freq|-f)
+                freq="$2"
+                shift 2
+                ;;
+            --channel|-c)
+                channel="$2"
+                shift 2
+                ;;
+            --width|-w)
+                width="$2"
+                shift 2
+                ;;
+            --bssid|-b)
+                bssid="$2"
+                shift 2
+                ;;
+            --ap-edca-json)
+                ap_edca_json="$2"
+                shift 2
+                ;;
+            --out-pcap|-o)
+                out_pcap="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    print_header "STANDALONE OVER-THE-AIR (OTA) WMM EDCA AUDIT"
+    log_info "Target Endpoint  : ${TARGET_USER}@${TARGET_HOST}"
+    log_info "Sniff Duration   : ${duration}s"
+
+    local ts
+    ts="$(date +%Y%m%d_%H%M%S)"
+    local rem_pcap="captures/ota_wmm_audit_${ts}.pcap"
+    local local_pcap="${out_pcap:-${LAB_DIR}/captures/ota_wmm_audit_${ts}.pcap}"
+
+    mkdir -p "$(dirname "${local_pcap}")" 2>/dev/null || true
+
+    local -a start_args=(
+        --pcap "${rem_pcap}"
+        --width "${width}"
+    )
+    if [[ -n "${freq}" ]]; then start_args+=(--freq "${freq}"); fi
+    if [[ -n "${channel}" ]]; then start_args+=(--channel "${channel}"); fi
+    if [[ -n "${bssid}" ]]; then start_args+=(--bssid "${bssid}"); fi
+
+    log_step "1. Starting temporary OTA sniffer on remote client..."
+    cmd_start_ota_monitor "${start_args[@]}" >/dev/null
+
+    log_step "2. Sniffing 802.11 management frames (${duration}s)..."
+    sleep "${duration}"
+
+    log_step "3. Stopping OTA sniffer and retrieving capture..."
+    cmd_stop_ota_monitor --pcap "${rem_pcap}" --fetch "${local_pcap}" >/dev/null
+
+    log_step "4. Auditing WMM Parameter Element from over-the-air capture..."
+    local -a audit_cmd=(
+        python3 "${LAB_DIR}/tools/wireless_qos_audit.py"
+        --audit-wmm
+        --ota-pcap "${local_pcap}"
+    )
+    if [[ -n "${bssid}" ]]; then audit_cmd+=(--bssid "${bssid}"); fi
+    if [[ -f "${ap_edca_json}" ]]; then audit_cmd+=(--ap-edca-json "${ap_edca_json}"); fi
+
+    "${audit_cmd[@]}"
 }
 
 cmd_fetch_capture() {
-    local remote_src="${1:-/tmp/remote_voice.pcap}"
+    local remote_src="${1:-captures/remote_wifi.pcap}"
     local local_dst="${2:-./captures/remote_voice.pcap}"
+    local target_src="${remote_src}"
+    if [[ "${target_src}" != /* ]]; then
+        if [[ "${target_src}" != captures/* && "${target_src}" != tmp/* ]]; then
+            target_src="captures/${target_src}"
+        fi
+        target_src="${TARGET_DIR}/${target_src}"
+    fi
     local ssh_r_opt
     ssh_r_opt="$(get_ssh_transport_opt)"
 
     mkdir -p "$(dirname "${local_dst}")" 2>/dev/null || true
 
     # Attempt rsync first using key-authenticated transport
-    if ! rsync -avz -e "${ssh_r_opt}" "${TARGET_USER}@${TARGET_HOST}:${remote_src}" "${local_dst}" >/dev/null 2>&1; then
+    if ! rsync -avz -e "${ssh_r_opt}" "${TARGET_USER}@${TARGET_HOST}:${target_src}" "${local_dst}" >/dev/null 2>&1; then
         # Fallback to scp if rsync fails
         local -a scp_cmd=("scp")
         if [[ -n "${TARGET_PORT}" && "${TARGET_PORT}" != "22" ]]; then
@@ -625,7 +1357,7 @@ cmd_fetch_capture() {
             IFS=" " read -r -a parsed_opts <<< "${SSH_OPTS_STR}"
             scp_cmd+=("${parsed_opts[@]}")
         fi
-        scp_cmd+=("${TARGET_USER}@${TARGET_HOST}:${remote_src}" "${local_dst}")
+        scp_cmd+=("${TARGET_USER}@${TARGET_HOST}:${target_src}" "${local_dst}")
         "${scp_cmd[@]}" >/dev/null 2>&1 || true
     fi
 
@@ -633,7 +1365,7 @@ cmd_fetch_capture() {
     if [[ -f "${local_dst}" ]]; then
         log_success "Fetched remote capture to ${local_dst}"
     else
-        log_warn "Failed to fetch remote capture from ${TARGET_HOST}:${remote_src}"
+        log_warn "Failed to fetch remote capture from ${TARGET_HOST}:${target_src}"
     fi
 }
 
@@ -743,6 +1475,26 @@ main() {
                     shift
                 fi
                 ;;
+            run-vod|vod)
+                action="run-vod"
+                shift
+                extra_args+=("$@")
+                break
+                ;;
+            run-wireless-qos|run-wqos|wireless-qos)
+                action="run-wireless-qos"
+                shift
+                extra_args+=("$@")
+                break
+                ;;
+            is-wireless-qos-running|is-wqos-running)
+                action="is-wireless-qos-running"
+                shift
+                ;;
+            stop-wireless-qos|stop-wqos)
+                action="stop-wireless-qos"
+                shift
+                ;;
             clean|stop)
                 action="clean"
                 shift
@@ -755,6 +1507,28 @@ main() {
                 ;;
             stop-capture|capture-stop)
                 action="stop-capture"
+                shift
+                extra_args+=("$@")
+                break
+                ;;
+            start-ota-monitor|ota-start)
+                action="start-ota-monitor"
+                shift
+                extra_args+=("$@")
+                break
+                ;;
+            stop-ota-monitor|ota-stop)
+                action="stop-ota-monitor"
+                shift
+                extra_args+=("$@")
+                break
+                ;;
+            status-ota-monitor|ota-status)
+                action="status-ota-monitor"
+                shift
+                ;;
+            audit-ota-wmm|ota-wmm-audit)
+                action="audit-ota-wmm"
                 shift
                 extra_args+=("$@")
                 break
@@ -810,11 +1584,35 @@ main() {
         is-voip-running)
             cmd_is_voip_running "${extra_args[@]:-}"
             ;;
+        run-vod)
+            cmd_run_vod "${extra_args[@]}"
+            ;;
+        run-wireless-qos)
+            cmd_run_wireless_qos "${extra_args[@]}"
+            ;;
+        is-wireless-qos-running)
+            cmd_is_wireless_qos_running
+            ;;
+        stop-wireless-qos)
+            cmd_stop_wireless_qos
+            ;;
         start-capture)
             cmd_start_capture "${extra_args[@]}"
             ;;
         stop-capture)
             cmd_stop_capture "${extra_args[@]:-}"
+            ;;
+        start-ota-monitor)
+            cmd_start_ota_monitor "${extra_args[@]}"
+            ;;
+        stop-ota-monitor)
+            cmd_stop_ota_monitor "${extra_args[@]}"
+            ;;
+        status-ota-monitor)
+            cmd_status_ota_monitor
+            ;;
+        audit-ota-wmm|ota-wmm-audit)
+            cmd_audit_ota_wmm "${extra_args[@]}"
             ;;
         fetch-capture)
             cmd_fetch_capture "${extra_args[@]}"

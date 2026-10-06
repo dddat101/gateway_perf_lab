@@ -58,11 +58,11 @@ print_namespaces_section() {
         "${DUT_NS:-ns-dut}:Virtual DUT Gateway:VIRTUAL:-:-:-:0"
         "${PC_NS:-ns-pc}:Gigabit Wired PC:VIRTUAL:v-pc-h:-:-:0"
         "${STB_NS:-ns-stb}:IPTV STB (100M):VIRTUAL:v-stb-h:-:-:0"
-        "${WLAN2G_NS:-ns-wlan2g}:Wi-Fi 2.4G Station:VIRTUAL:v-w2g-h:${DUT_SSID_2G:-U+NetF254}:2.4GHz:1"
-        "${WLAN5G_NS:-ns-wlan5g}:Wi-Fi 5G Station:VIRTUAL:v-w5g-h:${DUT_SSID_5G:-U+NetF254_5G}:5GHz:1"
-        "${WLAN6G_NS:-ns-wlan6g}:Wi-Fi 6G Station:VIRTUAL:v-w6g-h:${DUT_SSID_6G:-U+NetF254_6G}:6GHz:1"
-        "${PHONE1_NS:-ns-phone1}:Wi-Fi Phone 1 (VoIP):VIRTUAL:v-ph1-h:${DUT_SSID_VOIP:-${DUT_SSID_5G:-U+NetF254_5G}}:5GHz VoIP:1"
-        "${PHONE2_NS:-ns-phone2}:Wi-Fi Phone 2 (VoIP):VIRTUAL:v-ph2-h:${DUT_SSID_VOIP:-${DUT_SSID_5G:-U+NetF254_5G}}:5GHz VoIP:1"
+        "${WLAN2G_NS:-ns-wlan2g}:Wi-Fi 2.4G Station:VIRTUAL:v-w2g-h:${DUT_SSID_2G:-DUT_2.4G}:2.4GHz:1"
+        "${WLAN5G_NS:-ns-wlan5g}:Wi-Fi 5G Station:VIRTUAL:v-w5g-h:${DUT_SSID_5G:-DUT_5G}:5GHz:1"
+        "${WLAN6G_NS:-ns-wlan6g}:Wi-Fi 6G Station:VIRTUAL:v-w6g-h:${DUT_SSID_6G:-DUT_6G}:6GHz:1"
+        "${PHONE1_NS:-ns-phone1}:Wi-Fi Phone 1 (VoIP):VIRTUAL:v-ph1-h:${DUT_SSID_VOIP:-${DUT_SSID_5G:-DUT_5G}}:5GHz VoIP:1"
+        "${PHONE2_NS:-ns-phone2}:Wi-Fi Phone 2 (VoIP):VIRTUAL:v-ph2-h:${DUT_SSID_VOIP:-${DUT_SSID_5G:-DUT_5G}}:5GHz VoIP:1"
     )
 
     # 3. Print Unified Summary Table
@@ -262,7 +262,7 @@ print_namespaces_section() {
                 printf '    - Signal & Bitrate: Signal: %s | TX Bitrate: %s\n' "${w_signal:-N/A}" "${w_txrate:-N/A}"
             else
                 printf '    - Connected SSID  : \e[1;33m(None / Unassociated)\e[0m\n'
-                printf '    - Target DUT SSID : %s (Configured in config.env)\n' "${DUT_SSID_5G:-U+NetF254_5G}"
+                printf '    - Target DUT SSID : %s (Configured in config.env)\n' "${DUT_SSID_5G:-DUT_5G}"
                 printf '    - Action to Link  : Run \e[1;36msudo ./scripts/wifi_connect.sh connect 5g\e[0m\n'
             fi
             printf '    - IP / Gateway    : IPv4: %s | Gateway: %s\n' "${w_ip}" "${w_gw}"
@@ -300,7 +300,7 @@ print_namespaces_section() {
                 fi
             else
                 printf '    - Connected SSID  : \e[1;33m(None / Unassociated)\e[0m\n'
-                printf '    - Target DUT SSID : %s\n' "${DUT_SSID_2G:-U+NetF254}"
+                printf '    - Target DUT SSID : %s\n' "${DUT_SSID_2G:-DUT_2.4G}"
                 printf '    - Action to Link  : Run \e[1;36m./scripts/remote_client.sh wifi-connect 2g\e[0m\n'
             fi
             printf '    - Test Allocation : Remote Phone 2 for VoIP QoS (TC-QOS-01) / 3-way concurrent station\n'
