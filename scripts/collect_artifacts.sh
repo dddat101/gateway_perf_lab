@@ -322,7 +322,25 @@ main() {
     fi
     log_info "  -> System State      : ${cnt_state} diagnostics snapshot(s)"
 
-    # 6. Generate Manifest JSON
+    # 6. Collect DUT Diagnostic Artifacts (if DUT collector enabled and reachable)
+    local cnt_dut=0
+    local dir_dut="${bundle_dir}/dut_diagnostics"
+    if [[ "${DUT_COLLECTOR_ENABLED:-1}" == "1" && -x "${SCRIPT_DIR}/dut_collector.sh" ]]; then
+        if "${SCRIPT_DIR}/dut_collector.sh" test >/dev/null 2>&1; then
+            log_info "Collecting live DUT diagnostic artifact bundle..."
+            "${SCRIPT_DIR}/dut_collector.sh" collect --out-dir "${dir_dut}" >/dev/null 2>&1 || true
+            if [[ -d "${dir_dut}" ]]; then
+                cnt_dut="$(find "${dir_dut}" -type f | wc -l || echo "0")"
+                local dut_size
+                dut_size="$(du -sh "${dir_dut}" 2>/dev/null | cut -f1 || echo "0B")"
+                log_info "  -> DUT Diagnostics   : ${cnt_dut} artifact(s) (${dut_size})"
+            fi
+        else
+            log_info "  -> DUT Diagnostics   : Skipped (DUT not reachable or SSH auth unconfigured)"
+        fi
+    fi
+
+    # 7. Generate Manifest JSON
     local total_files
     total_files="$(find "${bundle_dir}" -type f | wc -l || echo "0")"
     local total_bytes
@@ -342,13 +360,14 @@ main() {
     "logs": ${cnt_logs},
     "captures_pcap": ${cnt_pcap},
     "state_files": ${cnt_state},
+    "dut_artifacts": ${cnt_dut},
     "total_files": ${total_files}
   },
   "total_bytes": ${total_bytes}
 }
 EOF
 
-    # 7. Generate Summary Markdown Report
+    # 8. Generate Summary Markdown Report
     {
         printf "# Gateway Performance Lab - Artifact Evidence Bundle\n\n"
         printf "* **Bundle Name:** \`%s\`\n" "${bundle_name}"
@@ -365,7 +384,11 @@ EOF
         printf "| **Raw iperf3 Trials** | \`raw_iperf/\` | %d | Second-by-second interval & CWND stats from iperf3 runs |\n" "${cnt_raw}"
         printf "| **Execution Logs** | \`logs/\` | %d | Full console output logs for test scenarios |\n" "${cnt_logs}"
         printf "| **Packet Captures** | \`captures/\` | %d | Dual/Multi-point PCAP evidence files (%s) |\n" "${cnt_pcap}" "${pcap_size_str:-0B}"
-        printf "| **System State** | \`system_state/\` | %d | Interface configurations, routes, and diagnostic snapshots |\n\n" "${cnt_state}"
+        printf "| **System State** | \`system_state/\` | %d | Interface configurations, routes, and diagnostic snapshots |\n" "${cnt_state}"
+        if (( cnt_dut > 0 )); then
+            printf "| **DUT Diagnostics** | \`dut_diagnostics/\` | %d | Kernel dmesg, hardware drop counters, QoS qdisc, WMM EDCA |\n" "${cnt_dut}"
+        fi
+        printf "\n"
 
         printf "## 2. Benchmark Metrics Overview\n\n"
         printf "| Test ID | Scenario Name | Output File | Verdict |\n"

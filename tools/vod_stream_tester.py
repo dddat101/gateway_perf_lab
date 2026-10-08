@@ -38,6 +38,7 @@ def parse_args():
     srv.add_argument("--bind-ip", default="0.0.0.0", help="Binding IP for handshake listening")
     srv.add_argument("--bind-port", type=int, default=0, help="Binding port for handshake listening (default: same as dest-port)")
     srv.add_argument("--report-interval", type=float, default=1.0, help="Periodic progress reporting interval in seconds (default: 1.0, 0 to disable)")
+    srv.add_argument("--dscp", type=int, default=34, help="IP DSCP value (default: 34 for Video AF41 = 0x88)")
 
     # Client mode
     cli = subparsers.add_parser("client", help="Run VOD Playback Client (STB)")
@@ -47,7 +48,12 @@ def parse_args():
     cli.add_argument("--server-port", type=int, default=0, help="Streaming server port (default: same as bind-port)")
     cli.add_argument("--duration", type=float, default=6.0, help="Listen duration in seconds")
     cli.add_argument("--report-interval", type=float, default=1.0, help="Periodic progress reporting interval in seconds (default: 1.0, 0 to disable)")
+    cli.add_argument("--dscp", type=int, default=34, help="IP DSCP value (default: 34 for Video AF41 = 0x88)")
     cli.add_argument("--output-json", default="", help="Path to write JSON results")
+    cli.add_argument("--min-throughput-mbps", type=float, default=35.0,
+                     help="Minimum playback throughput (default: 35 Mbps)")
+    cli.add_argument("--max-loss-pct", type=float, default=0.0,
+                     help="Maximum acceptable packet loss (default: 0%%)")
 
     return parser.parse_args()
 
@@ -61,6 +67,13 @@ def run_server(args):
         except Exception:
             pass
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+
+    # Set DSCP (e.g. 34 for AF41 Video -> TOS 0x88 = 136)
+    if getattr(args, "dscp", 0) > 0:
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, args.dscp << 2)
+        except Exception as e:
+            print(f"Warning: Could not set IP_TOS: {e}")
 
     target_addr = (args.dest_ip, args.dest_port)
 
@@ -183,6 +196,11 @@ def run_client(args):
         except Exception:
             pass
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+    if getattr(args, "dscp", 0) > 0:
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, args.dscp << 2)
+        except Exception as e:
+            print(f"Warning: Could not set IP_TOS: {e}")
     try:
         sock.bind((args.bind_ip, args.bind_port))
     except Exception as e:
@@ -312,7 +330,7 @@ def run_client(args):
         lost = 0
         loss_pct = 100.0
 
-    is_normal = (lost == 0) and (throughput_mbps >= 35.0) and (stall_events <= 1)
+    is_normal = (loss_pct <= args.max_loss_pct) and (throughput_mbps >= args.min_throughput_mbps) and (stall_events <= 1)
     status = "PASS" if is_normal else "FAIL"
 
     result = {

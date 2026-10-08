@@ -10,6 +10,7 @@ formatting structured test result artifacts for Gateway Performance Labs.
 import argparse
 import json
 import sys
+import math
 from pathlib import Path
 from typing import List, Tuple
 
@@ -489,6 +490,188 @@ def cmd_eval_sequential(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_eval_wireless_qos(args: argparse.Namespace) -> int:
+    """
+    Consolidate and evaluate Wireless QoS client-side metrics (Voice, Video, Best Effort)
+    into standard wireless_qos_audit schema.
+    """
+    voice_p = Path(args.voice_json) if args.voice_json else None
+    vod_p = Path(args.vod_json) if args.vod_json else None
+    be_p = Path(args.be_json) if args.be_json else None
+
+    voice_data = {}
+    if voice_p and voice_p.is_file():
+        try:
+            with open(voice_p, "r", encoding="utf-8") as f:
+                voice_data = json.load(f)
+        except Exception:
+            pass
+
+    vod_data = {}
+    if vod_p and vod_p.is_file():
+        try:
+            with open(vod_p, "r", encoding="utf-8") as f:
+                vod_data = json.load(f)
+        except Exception:
+            pass
+
+    be_mbps = args.be_mbps
+    be_tot, be_lost = 0, 0
+    be_loss_pct = 0.0
+    be_proto = getattr(args, "be_proto", "auto")
+    if be_p and be_p.is_file():
+        tot, lost, parsed_mbps = _parse_iperf_single(str(be_p))
+        if be_mbps is None or be_mbps == 0.0:
+            be_mbps = parsed_mbps
+        be_tot, be_lost = tot, lost
+        if be_tot > 0:
+            be_loss_pct = round((be_lost / be_tot) * 100.0, 2)
+        try:
+            with open(be_p, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            p_str = d.get("start", {}).get("test_start", {}).get("protocol")
+            if p_str:
+                be_proto = p_str.lower()
+        except Exception:
+            pass
+
+    if be_proto == "auto":
+        be_proto = "tcp"
+
+    be_status = "THROTTLED" if be_loss_pct > 0 else "NORMAL"
+
+    malformed = not isinstance(voice_data, dict) or not isinstance(vod_data, dict)
+    for data, required in ((voice_data, ("sent_packets", "received_packets", "loss_pct")),
+                           (vod_data, ("received_packets", "loss_pct", "throughput_mbps", "stall_events"))):
+        if not isinstance(data, dict):
+            continue
+        for key in required:
+            value = data.get(key)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                malformed = True
+                data[key] = 0
+        if data.get("loss_pct", 0) > 100:
+            malformed = True
+    if not isinstance(voice_data, dict):
+        voice_data = {}
+    if not isinstance(vod_data, dict):
+        vod_data = {}
+
+    v_sent = voice_data.get("sent_packets", 0)
+    v_rcv = voice_data.get("received_packets", 0)
+    v_loss_pct = voice_data.get("loss_pct", 0.0)
+    v_pass = (v_loss_pct <= args.max_loss_pct) and v_rcv > 0 and v_sent > 0
+
+    vid_rcv = vod_data.get("received_packets", 0)
+    vid_loss_pct = vod_data.get("loss_pct", 0.0)
+    vid_tput = vod_data.get("throughput_mbps", 0.0)
+    vid_stalls = vod_data.get("stall_events", 0)
+    vid_pass = (vid_loss_pct <= args.max_loss_pct) and (vid_stalls <= 1) and (vid_rcv > 0)
+
+    # Client counters measure application quality, not DSCP preservation,
+    # wireless queue congestion or an 802.11 QoS Control TID.
+    overall_pass = v_pass and vid_pass
+    be_invalid = True
+    if be_p and be_p.is_file():
+        try:
+            be_data = json.loads(be_p.read_text())
+            be_invalid = (not isinstance(be_data, dict) or bool(be_data.get("error"))
+                          or not be_data.get("end"))
+        except (OSError, ValueError):
+            pass
+    traffic_error = getattr(args, "traffic_error", "")
+    invalid = (bool(traffic_error) or malformed or not voice_data or not vod_data or v_sent <= 0 or v_rcv <= 0
+               or v_rcv > v_sent or vid_rcv <= 0 or vid_tput <= 0
+               or not math.isfinite(be_mbps) or be_mbps <= 0 or be_invalid)
+    quality_status = "INVALID" if invalid else "PASS" if overall_pass else "FAIL"
+    overall_verdict = "INVALID" if invalid else "INCONCLUSIVE" if overall_pass else "FAIL"
+
+    results = {
+        "test": "wireless_qos_multi_service",
+        "measurement_source": "client_application_counters",
+        "verdict": overall_verdict,
+        "overall_status": overall_verdict,
+        "quality_status": quality_status,
+        "reasons": [traffic_error or "Missing or unsuccessful Voice, Video or Best Effort traffic"] if invalid
+                   else ["Client counters cannot verify DSCP/TID, jitter or Wi-Fi bottleneck"],
+        "mode": getattr(args, "mode", "virtual"),
+        "services": {
+            "voice": {
+                "service_name": "VoIP / VoWiFi Call",
+                "dscp_value": args.voice_dscp,
+                "dscp_hex": hex(args.voice_dscp << 2),
+                "expected_wmm_ac": "AC_VO",
+                "tid": None,
+                "wan_packets": v_sent,
+                "lan_packets": v_rcv,
+                "loss_pct": round(v_loss_pct, 2),
+                "dscp_preservation_pct": None,
+                "status": "PASS" if v_pass else "FAIL"
+            },
+            "video": {
+                "service_name": "Video Streaming / VOD",
+                "dscp_value": args.video_dscp,
+                "dscp_hex": hex(args.video_dscp << 2),
+                "expected_wmm_ac": "AC_VI",
+                "tid": None,
+                "lan_packets": vid_rcv,
+                "throughput_mbps": round(vid_tput, 2),
+                "stall_events": vid_stalls,
+                "loss_pct": round(vid_loss_pct, 2),
+                "dscp_preservation_pct": None,
+                "status": "PASS" if vid_pass else "FAIL"
+            },
+            "best_effort": {
+                "service_name": f"Background Load (Bulk Transfer - {be_proto.upper()})",
+                "protocol": be_proto.upper(),
+                "dscp_value": 0,
+                "dscp_hex": "0x00",
+                "wmm_ac": "AC_BE",
+                "tid": 0,
+                "throughput_mbps": round(be_mbps or 0.0, 2),
+                "total_packets": be_tot,
+                "lost_packets": be_lost,
+                "loss_pct": be_loss_pct,
+                "status": be_status
+            }
+        }
+    }
+
+    if args.output:
+        out_p = Path(args.output)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_p, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+
+    if not getattr(args, "quiet", False):
+        print("\n" + "=" * 80)
+        print("  IEEE 802.11e WIRELESS QoS (WMM & DSCP MAPPING) AUDIT [CLIENT METRICS]")
+        print("=" * 80)
+        print(f"  Execution Mode      : [{getattr(args, 'mode', 'virtual').upper()}]")
+        print(f"  Voice Client Metrics: {args.voice_json or 'N/A'}")
+        print(f"  Video Client Metrics: {args.vod_json or 'N/A'}")
+        print("-" * 80)
+        print(f"{'SERVICE CLASS':<18} {'TARGET DSCP':<12} {'EXPECTED AC':<14} {'SENT/RX PKTS':<14} {'LOSS %':<8} {'DETAILS':<14} {'STATUS'}")
+        print("-" * 80)
+        v_col = "\033[1;32mPASS\033[0m" if v_pass else "\033[1;31mFAIL\033[0m"
+        print(f"{'Voice (VoIP/VoWi)':<18} {f'{args.voice_dscp} ({hex(args.voice_dscp << 2)})':<12} {'AC_VO (TID 6)':<14} {f'{v_sent}/{v_rcv}':<14} {f'{v_loss_pct:.2f}%':<8} {'Voice Stream':<14} {v_col}")
+
+        vid_col = "\033[1;32mPASS\033[0m" if vid_pass else "\033[1;31mFAIL\033[0m"
+        print(f"{'Video (VOD/IPTV)':<18} {f'{args.video_dscp} ({hex(args.video_dscp << 2)})':<12} {'AC_VI (TID 5)':<14} {f'{vid_rcv:,} rx':<14} {f'{vid_loss_pct:.2f}%':<8} {f'{vid_tput:.1f} Mbps':<14} {vid_col}")
+
+        be_col = "\033[1;33mTHROTTLED\033[0m" if be_loss_pct > 0 else "\033[1;32mNORMAL\033[0m"
+        be_label = f"Best Effort ({be_proto.upper()})"
+        be_pkts_str = f"{be_tot - be_lost}/{be_tot}" if be_tot > 0 else "Saturated"
+        print(f"{be_label:<18} {'0 (0x00)':<12} {'AC_BE (TID 0)':<14} {be_pkts_str:<14} {f'{be_loss_pct:.2f}%':<8} {f'{be_mbps or 0.0:.1f} Mbps':<14} {be_col}")
+        print("-" * 80)
+        print(f"  APPLICATION QUALITY: {quality_status}")
+        print(f"  OVERALL VERDICT: {overall_verdict} (Client metrics only)")
+        print("=" * 80 + "\n")
+
+    return 2 if invalid or overall_verdict == "INCONCLUSIVE" else 1
+
+
 def cmd_get_field(args: argparse.Namespace) -> int:
     """
     Safely extract a specific field value from a JSON file.
@@ -721,6 +904,22 @@ def main() -> int:
     p_card.add_argument("file", help="Path to JSON test result file.")
     p_card.add_argument("--json", action="store_true", help="Output raw JSON instead of formatted card.")
     p_card.set_defaults(func=cmd_format_card)
+
+    # 8. eval-wireless-qos
+    p_wqos = subparsers.add_parser("eval-wireless-qos", help="Evaluate Wireless QoS client-side metrics.")
+    p_wqos.add_argument("--voice-json", help="Path to VoIP client JSON result.")
+    p_wqos.add_argument("--vod-json", help="Path to VOD client JSON result.")
+    p_wqos.add_argument("--be-json", help="Path to Best Effort iperf3 JSON result.")
+    p_wqos.add_argument("--be-proto", default="auto", choices=["auto", "tcp", "udp"], help="Best Effort transport protocol.")
+    p_wqos.add_argument("--be-mbps", type=float, default=0.0, help="Best Effort throughput in Mbps.")
+    p_wqos.add_argument("--mode", default="virtual", help="Test execution mode.")
+    p_wqos.add_argument("--voice-dscp", type=int, default=46, help="Target DSCP for Voice.")
+    p_wqos.add_argument("--video-dscp", type=int, default=34, help="Target DSCP for Video.")
+    p_wqos.add_argument("--max-loss-pct", type=float, default=1.0, help="Max loss percentage for priority services.")
+    p_wqos.add_argument("--output", "-o", help="Path to output wireless_qos_audit.json.")
+    p_wqos.add_argument("--quiet", action="store_true", help="Suppress terminal output.")
+    p_wqos.add_argument("--traffic-error", default="", help="Generator startup or execution failure.")
+    p_wqos.set_defaults(func=cmd_eval_wireless_qos)
 
     args = parser.parse_args()
     return args.func(args)

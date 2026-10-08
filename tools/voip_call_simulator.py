@@ -26,6 +26,7 @@ def parse_args():
     srv.add_argument("--bind-ip", default="0.0.0.0", help="Binding IP address")
     srv.add_argument("--ports", default="10000,10002", help="Comma-separated UDP ports to listen on")
     srv.add_argument("--duration", type=float, default=60.0, help="Server run duration in seconds")
+    srv.add_argument("--dscp", type=int, default=46, help="IP DSCP value (default: 46 for Voice EF = 0xb8)")
 
     # Client mode (in ns-phone1, ns-phone2, or physical Wi-Fi interface)
     cli = subparsers.add_parser("client", help="Run Wi-Fi Phone Call Endpoint")
@@ -35,6 +36,7 @@ def parse_args():
     cli.add_argument("--bind-port", type=int, default=0, help="Local UDP port to bind")
     cli.add_argument("--duration", type=float, default=30.0, help="Call duration in seconds")
     cli.add_argument("--phone-id", default="phone-1", help="Identifier for logging")
+    cli.add_argument("--dscp", type=int, default=46, help="IP DSCP value (default: 46 for Voice EF = 0xb8)")
     cli.add_argument("--output-json", default="", help="Path to write JSON results")
 
     return parser.parse_args()
@@ -64,6 +66,11 @@ def run_server(args):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
+        if getattr(args, "dscp", 0) > 0:
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, args.dscp << 2)
+            except Exception as e:
+                print(f"Warning: Could not set IP_TOS on server socket: {e}")
         sock.bind((args.bind_ip, port))
         sockets.append(sock)
 
@@ -81,11 +88,13 @@ def run_client(args):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
 
-    # Set DSCP EF (Expedited Forwarding = DSCP 46 -> IP TOS 0xb8 = 184)
-    try:
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0xb8)
-    except Exception as e:
-        print(f"Warning: Could not set IP_TOS: {e}")
+    # Set DSCP (default EF: DSCP 46 -> IP TOS 0xb8 = 184)
+    dscp_val = getattr(args, "dscp", 46)
+    if dscp_val > 0:
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, dscp_val << 2)
+        except Exception as e:
+            print(f"Warning: Could not set IP_TOS: {e}")
 
     # Optionally bind to local IP/port (e.g. physical Wi-Fi IP)
     bind_ip = getattr(args, "bind_ip", "0.0.0.0")

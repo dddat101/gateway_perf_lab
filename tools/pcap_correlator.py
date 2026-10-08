@@ -117,7 +117,7 @@ def stream_pcap(
         return
 
     cmd = [
-        "tshark", "-r", pcap_path,
+        "tshark", "-r", "-",
         "-n", "-q",
         "-T", "fields",
         "-e", "frame.number",
@@ -133,8 +133,10 @@ def stream_pcap(
         cmd.extend(["-Y", display_filter])
 
     try:
+        f = open(pcap_path, "rb")
         proc = subprocess.Popen(
             cmd,
+            stdin=f,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -144,25 +146,27 @@ def stream_pcap(
         print(f"Error starting tshark on {pcap_path}: {e}", file=sys.stderr)
         return
 
-    for line in proc.stdout:
-        parts = line.rstrip("\n").split("\t")
-        if len(parts) >= 3:
-            try:
-                f_num = int(parts[0])
-                t_epoch = float(parts[1])
-                f_len = int(parts[2])
-                ip_id = parts[3] if len(parts) > 3 else ""
-                ipv6_flow = parts[4] if len(parts) > 4 else ""
-                tcp_seq = parts[5] if len(parts) > 5 else ""
-                rtp_seq = parts[6] if len(parts) > 6 else ""
-                payload_hex = parts[7] if len(parts) > 7 else ""
+    try:
+        for line in proc.stdout:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 3:
+                try:
+                    f_num = int(parts[0])
+                    t_epoch = float(parts[1])
+                    f_len = int(parts[2])
+                    ip_id = parts[3] if len(parts) > 3 else ""
+                    ipv6_flow = parts[4] if len(parts) > 4 else ""
+                    tcp_seq = parts[5] if len(parts) > 5 else ""
+                    rtp_seq = parts[6] if len(parts) > 6 else ""
+                    payload_hex = parts[7] if len(parts) > 7 else ""
 
-                key = extract_packet_key(ip_id, ipv6_flow, tcp_seq, rtp_seq, f_len, payload_hex)
-                yield (f_num, t_epoch, f_len, key)
-            except (ValueError, IndexError):
-                continue
-
-    proc.wait()
+                    key = extract_packet_key(ip_id, ipv6_flow, tcp_seq, rtp_seq, f_len, payload_hex)
+                    yield (f_num, t_epoch, f_len, key)
+                except (ValueError, IndexError):
+                    continue
+    finally:
+        proc.wait()
+        f.close()
 
 
 def correlate_captures(

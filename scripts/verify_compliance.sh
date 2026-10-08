@@ -57,6 +57,9 @@ check_assertion() {
     if [[ "${status}" == "PASS" ]]; then
         PASSED_TESTS=$(( PASSED_TESTS + 1 ))
         printf '  \e[1;32m[PASS]\e[0m    [%s] %s\n            Detail: %s\n' "${test_id}" "${title}" "${detail}"
+    elif [[ "${status}" == "INVALID" || "${status}" == "INCONCLUSIVE" ]]; then
+        SKIPPED_TESTS=$(( SKIPPED_TESTS + 1 ))
+        printf '  \e[1;33m[%s]\e[0m [%s] %s\n            Detail: %s\n' "${status}" "${test_id}" "${title}" "${detail}"
     elif [[ "${status}" == "NOT_RUN" || "${status}" == "SKIP" ]]; then
         SKIPPED_TESTS=$(( SKIPPED_TESTS + 1 ))
         printf '  \e[1;33m[NOT RUN]\e[0m [%s] %s\n            Detail: %s\n' "${test_id}" "${title}" "${detail}"
@@ -284,6 +287,26 @@ main() {
         check_assertion "TC-QOS-01" "PC Throughput during 2 Wi-Fi Phone Calls (|A-B|/A <= 1%)" "${q_verdict}" "${detail_str}"
     else
         check_assertion "TC-QOS-01" "PC Throughput during 2 Wi-Fi Phone Calls (|A-B|/A <= 1%)" "NOT_RUN" "Phase not executed (run: sudo ./scripts/scenario.sh voice_qos)"
+    fi
+
+    print_section "6. WIRELESS QOS & IEEE 802.11e WMM OPTIMIZATION [TC-WQOS-01]"
+    # TC-WQOS-01: Voice & Video priority preservation under Best Effort congestion
+    local wqos_log="${LOG_DIR}/wireless_qos_audit.json"
+    if [[ -f "${wqos_log}" ]]; then
+        local w_verdict w_voice_loss w_video_loss w_be_mbps w_mode
+        w_verdict="$(parse_json_field "${wqos_log}" "verdict")"
+        if [[ -z "${w_verdict}" || "${w_verdict}" == "MISSING" ]]; then
+            w_verdict="$(parse_json_field "${wqos_log}" "overall_status")"
+        fi
+        w_mode="$(parse_json_field "${wqos_log}" "mode")"
+        w_voice_loss="$(python3 -c "import json; d=json.load(open('${wqos_log}')); print(d.get('services',{}).get('voice',{}).get('loss_pct', 0.0))" 2>/dev/null || echo "0.0")"
+        w_video_loss="$(python3 -c "import json; d=json.load(open('${wqos_log}')); print(d.get('services',{}).get('video',{}).get('loss_pct', 0.0))" 2>/dev/null || echo "0.0")"
+        w_be_mbps="$(python3 -c "import json; d=json.load(open('${wqos_log}')); print(d.get('services',{}).get('best_effort',{}).get('throughput_mbps', 0.0))" 2>/dev/null || echo "0.0")"
+
+        check_assertion "TC-WQOS-01" "Wireless QoS Multi-Service Prioritization (Voice & Video <= 1.0% Loss)" "${w_verdict}" \
+            "Voice Loss: ${w_voice_loss}% | Video Loss: ${w_video_loss}% | BE Traffic: ${w_be_mbps} Mbps | Mode: ${w_mode}"
+    else
+        check_assertion "TC-WQOS-01" "Wireless QoS Multi-Service Prioritization (Voice & Video <= 1.0% Loss)" "NOT_RUN" "Phase not executed (run: sudo ./scripts/scenario.sh wireless_qos)"
     fi
 
     # Dual-sided PCAP Evidence Comparison

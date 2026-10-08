@@ -107,6 +107,78 @@ Before running tests, perform these non-root health checks:
   - Verify Token Bucket Filter (TBF) parameters:
     `rate 100Mbit`, `burst 512Kb`, `limit 4Mb`.
 
+### 2.7 USB-to-LAN Throughput Bottleneck & Max Bitrate Verification
+* **Symptom:** TCP throughput on `ns-pc` (or `PC_IF` / `LAN_IF`) caps around ~930–940 Mbps, or drops unexpectedly to ~300–350 Mbps.
+* **Root Causes:**
+  1. **USB 2.0 Fallback**: USB 3.0 adapter accidentally plugged into a USB 2.0 port or negotiated at HighSpeed (480 Mbps), limiting actual throughput to ~320–380 Mbps.
+  2. **Physical Ethernet Ceiling**: A 1 Gbps link has a theoretical L4 TCP payload limit of ~941–949 Mbps due to L1–L4 headers. A measured 930–940 Mbps represents full wire-rate saturation (98–99% efficiency).
+  3. **Traffic Control (TC) Shaping**: The internal veth bridge pair (`v-pc-h`) has a `tbf` rate limiter configured to 1 Gbps.
+* **Diagnostic Workflow & Verification Commands:**
+
+  1. **Check USB Bus Negotiation & Speed (lsusb)**:
+     ```bash
+     lsusb
+     lsusb -t
+     ```
+     - *Healthy USB 3.0*: Must show `Driver=xhci_hcd` and `5000M` (SuperSpeed 5 Gbps).
+     - *Bottleneck USB 2.0*: Shows `480M` (HighSpeed), causing bandwidth to throttle at ~350 Mbps.
+
+  2. **Inspect sysfs Hardware Mapping & Physical Negotiated Speed**:
+     ```bash
+     for iface in /sys/class/net/enx*; do
+         if [ -e "$iface" ]; then
+             echo "=== $(basename "$iface") ==="
+             readlink -f "$iface/device"
+             echo -n "MAC   : "; cat "$iface/address" 2>/dev/null
+             echo -n "Speed : "; cat "$iface/speed" 2>/dev/null; echo " Mbps"
+         fi
+     done
+     ```
+     - Verifies whether the physical NIC is negotiated at `1000` (1 Gbps) or `2500` (2.5 Gbps Multi-Gigabit).
+
+  3. **Inspect PHY Link State, Driver, and Hardware Offloads (ethtool)**:
+     ```bash
+     # Check link speed, duplex, and partner advertised modes
+     ethtool <interface>
+
+     # Check driver and firmware version (e.g. r8152, rtl8153)
+     ethtool -i <interface>
+
+     # Verify Hardware Offload acceleration (TSO, GSO, GRO, Checksums)
+     ethtool -k <interface> | grep -E "tcp-segmentation-offload|generic-segmentation-offload|generic-receive-offload|rx-checksumming|tx-checksumming"
+     ```
+
+  4. **Check Interface Error Counters & Drops**:
+     ```bash
+     ip -s link show dev <interface>
+     ```
+     - Verify that `errors`, `carrier`, and `collsns` remain `0`.
+
+  5. **Inspect Virtual Bridge & Traffic Control Rate Limiter (tc & veth)**:
+     ```bash
+     # Inspect LAN bridge and host-side veth endpoint
+     ip -s link show dev br-test-lan
+     ip -s link show dev v-pc-h
+
+     # Check active TC qdisc rate-limiting parameters
+     tc qdisc show dev v-pc-h
+     tc qdisc show dev <interface>
+     ```
+     - Look for `qdisc tbf ... rate 1Gbit burst 512Kb latency 50ms`.
+
+* **1 Gbps Wire-Rate Theoretical Maximum Calculation Reference (MTU 1500)**:
+  | Header Layer | Overhead per Frame | Cumulative Size |
+  | :--- | :--- | :--- |
+  | **L1 Physical** | Preamble (7B) + SFD (1B) + Inter-Packet Gap (12B) | 20 Bytes |
+  | **L2 Data Link** | Ethernet MAC Header (14B) + FCS CRC (4B) | 18 Bytes |
+  | **L3 Network** | IPv4 Header | 20 Bytes |
+  | **L4 Transport** | TCP Header (20B) + TCP Timestamps Option (12B) | 32 Bytes |
+  | **TCP Payload (MSS)** | $1500\text{ B (MTU)} - 20\text{ B} - 32\text{ B}$ | **1,448 Bytes** |
+  | **Total on Wire** | $1500\text{ B} + 18\text{ B} + 20\text{ B}$ | **1,538 Bytes** |
+
+  $$\text{Max Theoretical TCP Throughput} = \frac{1448\text{ Bytes}}{1538\text{ Bytes}} \times 1000\text{ Mbps} \approx \mathbf{941.48\text{ Mbps}}$$
+  *(933.22 Mbps represents **99.12%** of the theoretical physical maximum on a 1 Gbps link).*
+
 ---
 
 ## 3. Safe Teardown & Reset

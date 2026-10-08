@@ -18,17 +18,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 def run_tshark_count(pcap_path: str, display_filter: str) -> int:
-    """Count packets matching a display filter in a PCAP file using tshark."""
+    """Count packets matching a display filter in a PCAP file using tshark via stdin (AppArmor-safe)."""
     if not pcap_path or not Path(pcap_path).is_file():
         return 0
 
     cmd = [
-        "tshark", "-r", pcap_path,
+        "tshark", "-r", "-",
         "-Y", display_filter,
         "-T", "fields", "-e", "frame.number"
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        with open(pcap_path, "rb") as f:
+            proc = subprocess.run(cmd, stdin=f, capture_output=True, text=True, check=False)
         lines = [line for line in proc.stdout.strip().splitlines() if line.strip()]
         return len(lines)
     except Exception:
@@ -37,7 +38,7 @@ def run_tshark_count(pcap_path: str, display_filter: str) -> int:
 
 def parse_rtp_streams(pcap_path: str, decode_ports: List[int]) -> List[Dict[str, Any]]:
     """
-    Extract RTP stream statistics (packets, lost, delta, jitter) using tshark -z rtp,streams.
+    Extract RTP stream statistics (packets, lost, delta, jitter) using tshark -z rtp,streams via stdin (AppArmor-safe).
     """
     if not pcap_path or not Path(pcap_path).is_file():
         return []
@@ -45,10 +46,11 @@ def parse_rtp_streams(pcap_path: str, decode_ports: List[int]) -> List[Dict[str,
     cmd = ["tshark"]
     for port in decode_ports:
         cmd.extend(["-d", f"udp.port=={port},rtp"])
-    cmd.extend(["-r", pcap_path, "-q", "-z", "rtp,streams"])
+    cmd.extend(["-r", "-", "-q", "-z", "rtp,streams"])
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        with open(pcap_path, "rb") as f:
+            proc = subprocess.run(cmd, stdin=f, capture_output=True, text=True, check=False)
         output = proc.stdout
     except Exception:
         return []

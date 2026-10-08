@@ -180,7 +180,7 @@ start_dual_capture() {
         if [[ -n "${DETECTED_WIFI_IF:-}" ]]; then
             wifi_if="${DETECTED_WIFI_IF}"
         elif command -v iw >/dev/null 2>&1; then
-            wifi_if="$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2; exit}' || true)"
+            wifi_if="$(iw dev 2>/dev/null | awk '$1=="Interface" && $2 !~ /mon/ {print $2; exit}' || true)"
         fi
     fi
 
@@ -660,11 +660,11 @@ compare_captures() {
         if [[ ! -f "${p}" ]]; then echo "0 0"; return; fi
         local res=""
         if [[ -n "${flt}" ]]; then
-            log_cmd "${TSHARK_BIN:-tshark} -r ${p} -n -q -z \"io,stat,0,${flt}\""
-            res="$("${TSHARK_BIN:-tshark}" -r "${p}" -n -q -z "io,stat,0,${flt}" 2>/dev/null | awk -F'|' '/<>/ {gsub(/[ \t]/, "", $3); gsub(/[ \t]/, "", $4); print $3, $4}' || true)"
+            log_cmd "cat \"${p}\" | ${TSHARK_BIN:-tshark} -r - -n -q -z \"io,stat,0,${flt}\""
+            res="$(cat "${p}" 2>/dev/null | "${TSHARK_BIN:-tshark}" -r - -n -q -z "io,stat,0,${flt}" 2>/dev/null | awk -F'|' '/<>/ {gsub(/[ \t]/, "", $3); gsub(/[ \t]/, "", $4); print $3, $4}' || true)"
         else
-            log_cmd "${TSHARK_BIN:-tshark} -r ${p} -n -q -z \"io,stat,0\""
-            res="$("${TSHARK_BIN:-tshark}" -r "${p}" -n -q -z "io,stat,0" 2>/dev/null | awk -F'|' '/<>/ {gsub(/[ \t]/, "", $3); gsub(/[ \t]/, "", $4); print $3, $4}' || true)"
+            log_cmd "cat \"${p}\" | ${TSHARK_BIN:-tshark} -r - -n -q -z \"io,stat,0\""
+            res="$(cat "${p}" 2>/dev/null | "${TSHARK_BIN:-tshark}" -r - -n -q -z "io,stat,0" 2>/dev/null | awk -F'|' '/<>/ {gsub(/[ \t]/, "", $3); gsub(/[ \t]/, "", $4); print $3, $4}' || true)"
         fi
         local frames="" bytes=""
         if [[ -n "${res}" ]]; then
@@ -673,7 +673,7 @@ compare_captures() {
         if [[ -z "${frames}" || ! "${frames}" =~ ^[0-9]+$ ]]; then
             local -a extra=()
             if [[ -n "${flt}" ]]; then extra+=("-Y" "${flt}"); fi
-            frames="$("${TSHARK_BIN:-tshark}" -r "${p}" "${extra[@]}" -T fields -e frame.number 2>/dev/null | wc -l || echo "0")"
+            frames="$(cat "${p}" 2>/dev/null | "${TSHARK_BIN:-tshark}" -r - "${extra[@]}" -T fields -e frame.number 2>/dev/null | wc -l || echo "0")"
             bytes="0"
         fi
         echo "${frames:-0} ${bytes:-0}"
@@ -766,7 +766,44 @@ compare_captures() {
         fi
         printf '==================================================================\n\n'
         return 0
-    elif (( is_merged == 0 )) && [[ "${tag}" =~ (voice|qos) ]]; then
+    elif [[ "${tag}" =~ (wireless_qos|wmm_qos|tc_wqos|wqos) ]]; then
+        local wqos_py="${LAB_DIR:-${PROJECT_ROOT}}/tools/wireless_qos_audit.py"
+        if [[ -x "${wqos_py}" ]]; then
+            local eff_lan="${lan_pcap}"
+            local eff_wifi="${wifi_pcap}"
+            if (( is_merged == 1 )) && [[ -f "${STATE_DIR}/latest_lan_merged_pcap.txt" ]]; then
+                eff_lan="$(cat "${STATE_DIR}/latest_lan_merged_pcap.txt" 2>/dev/null || echo "${lan_pcap}")"
+                eff_wifi=""
+            elif [[ -z "${eff_wifi}" || ! -f "${eff_wifi}" ]] && [[ -f "${STATE_DIR}/latest_wifi_pcap.txt" ]]; then
+                eff_wifi="$(cat "${STATE_DIR}/latest_wifi_pcap.txt" 2>/dev/null || true)"
+            fi
+            local wqos_json="${LOG_DIR:-${PROJECT_ROOT}/logs}/wireless_qos_audit.json"
+            local -a wqos_cmd=("${wqos_py}" "--wan-pcap" "${wan_pcap}" "--lan-pcap" "${eff_lan}")
+            if [[ -f "${STATE_DIR}/latest_wqos_context.json" ]]; then
+                wqos_cmd+=("--context-json" "${STATE_DIR}/latest_wqos_context.json")
+            fi
+            if [[ -n "${eff_wifi}" && -f "${eff_wifi}" && "${eff_wifi}" != "${eff_lan}" ]]; then
+                wqos_cmd+=("--wifi-pcap" "${eff_wifi}")
+            fi
+            if [[ -f "${STATE_DIR}/latest_ota_pcap.txt" ]]; then
+                local eff_ota
+                eff_ota="$(cat "${STATE_DIR}/latest_ota_pcap.txt" 2>/dev/null || true)"
+                if [[ -n "${eff_ota}" && -f "${eff_ota}" ]]; then
+                    wqos_cmd+=("--ota-pcap" "${eff_ota}")
+                fi
+            fi
+            local ap_edca="${LOG_DIR:-${PROJECT_ROOT}/logs}/ap_edca.json"
+            if [[ -f "${ap_edca}" ]]; then
+                wqos_cmd+=("--ap-edca-json" "${ap_edca}")
+            fi
+            wqos_cmd+=("--output-json" "${wqos_json}")
+            log_cmd "${wqos_cmd[*]}"
+            "${wqos_cmd[@]}" || true
+        else
+            log_info "Wireless QoS multi-service capture detected. Run tools/wireless_qos_audit.py for multi-stream evaluation."
+        fi
+        return 0
+    elif (( is_merged == 0 )) && [[ "${tag}" =~ (voice|tc_qos) ]]; then
         local audit_py="${LAB_DIR:-${PROJECT_ROOT}}/tools/voip_pcap_audit.py"
         if [[ -x "${audit_py}" ]]; then
             local p1_cap p2_cap v_mode
