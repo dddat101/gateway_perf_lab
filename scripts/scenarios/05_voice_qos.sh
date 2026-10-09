@@ -6,6 +6,15 @@
 # Refactored with Defensive Bash Programming Patterns
 # ==============================================================================
 
+# Defensive bootstrap: auto-source scenario_common.sh if running in standalone test harness
+if ! declare -F terminate_bg_pids >/dev/null 2>&1; then
+    _scn_common_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)/scenario_common.sh"
+    if [[ -f "${_scn_common_lib}" ]]; then
+        source "${_scn_common_lib}"
+    fi
+    unset _scn_common_lib
+fi
+
 # Canonical constants
 readonly VOIP_DEFAULT_CONCURRENT_DURATION=4
 readonly VOIP_DEFAULT_BASELINE_DURATION=4
@@ -60,46 +69,14 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# Process Supervision & Network Helpers
+# Process Supervision & Network Helpers (Traffic Orchestrator Adapters)
 # ------------------------------------------------------------------------------
 _voip_terminate_pids() {
-    local pids=("$@")
-    if (( ${#pids[@]} == 0 )); then
-        return 0
-    fi
-
-    for pid in "${pids[@]}"; do
-        if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
-            kill -TERM "${pid}" 2>/dev/null || true
-        fi
-    done
-
-    sleep 0.2
-
-    for pid in "${pids[@]}"; do
-        if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
-            kill -KILL "${pid}" 2>/dev/null || true
-        fi
-    done
+    traffic_stop_group "$@"
 }
 
 _voip_cleanup_network() {
-    local added_route="$1"
-    local added_mangle="$2"
-    local wifi_if="$3"
-
-    if (( added_route == 1 )) && [[ -n "${wifi_if}" ]]; then
-        log_cmd "ip route del ${WAN_SERVER_IP:-10.10.0.1} via ${DUT_LAN_IP:-192.168.1.1} dev ${wifi_if}"
-        ip route del "${WAN_SERVER_IP:-10.10.0.1}" via "${DUT_LAN_IP:-192.168.1.1}" dev "${wifi_if}" 2>/dev/null || true
-        CLEANUP_WIFI_ROUTE=""
-    fi
-
-    if (( added_mangle == 1 )) && [[ -n "${wifi_if}" ]]; then
-        log_cmd "iptables -t mangle -D POSTROUTING -o ${wifi_if} -p udp -m multiport --dports ${VOIP_PORTS_LIST} -j DSCP --set-dscp ${VOIP_DSCP_MARK}"
-        iptables -t mangle -D POSTROUTING -o "${wifi_if}" -p udp -m multiport --dports "${VOIP_PORTS_LIST}" -j DSCP --set-dscp "${VOIP_DSCP_MARK}" 2>/dev/null || true
-        iptables -t mangle -D POSTROUTING -o "${wifi_if}" -p udp -m multiport --sports "${VOIP_PORTS_LIST}" -j DSCP --set-dscp "${VOIP_DSCP_MARK}" 2>/dev/null || true
-        CLEANUP_IPTABLES_MANGLE=""
-    fi
+    station_adapter_release
 
     if [[ -n "${CLEANUP_WAN_MANGLE:-}" ]]; then
         eval "${CLEANUP_WAN_MANGLE}" 2>/dev/null || true
@@ -159,34 +136,10 @@ run_phase_voice_qos() {
         fi
     fi
 
-    # 2. Topology Mode Detection
-    local env_dump
-    env_dump="$("${tools_dir}/wifi_inspector.py" export-env --check-ping "${DUT_LAN_IP:-192.168.1.1}" 2>/dev/null || true)"
-    eval "${env_dump}"
-
-    local eff_mode="${CUSTOM_WIFI_MODE:-auto}"
-    if [[ "${eff_mode}" == "auto" ]]; then
-        if [[ "${TOPOLOGY_MODE:-virtual}" == "virtual" ]]; then
-            eff_mode="virtual"
-        elif (( ${WIFI_CARD_COUNT:-0} == 0 )); then
-            eff_mode="virtual"
-        elif [[ -z "${DETECTED_WIFI_SSID:-}" ]]; then
-            log_warn "Physical Wi-Fi card detected (${DETECTED_WIFI_IF}) but not connected to SSID. Falling back to virtual netns."
-            eff_mode="virtual"
-        elif [[ -n "${REMOTE_CLIENT_HOST:-}" ]] && "${SCRIPT_DIR}/remote_client.sh" test-connection >/dev/null 2>&1; then
-            eff_mode="distributed"
-        else
-            eff_mode="physical_single"
-        fi
-    elif [[ "${eff_mode}" == "real_single" || "${eff_mode}" == "real_single_band" ]]; then
-        eff_mode="physical_single"
-    elif [[ "${eff_mode}" == "remote" || "${eff_mode}" == "remote_only" ]]; then
-        eff_mode="remote_only"
-    elif [[ "${eff_mode}" == "distributed" || "${eff_mode}" == "tri_station" ]]; then
-        eff_mode="distributed"
-    elif [[ "${eff_mode}" == "emulated" ]]; then
-        eff_mode="virtual"
-    fi
+    # 2. Topology Mode Detection via Running Context Resolver
+    orchestrator_resolve_context
+    local eff_mode="${PLAN_VOIP_MODE:-virtual}"
+    orchestrator_show_plan "TC-QOS-01 VoIP QoS Isolation"
 
     local wifi_ip="${DETECTED_WIFI_IP:-}"
     if [[ -z "${wifi_ip}" && ( "${eff_mode}" == "physical_single" || "${eff_mode}" == "distributed" ) ]]; then
@@ -249,24 +202,19 @@ run_phase_voice_qos() {
         return 0
     fi
 
-    # 3. Network routing & DSCP preparation for physical Wi-Fi
-    local added_wifi_route=0
-    local added_mangle_rule=0
+    # 3. Ensure client endpoints and routes in virtual mode
+    if [[ "${eff_mode}" == "virtual" ]]; then
+        ensure_client_endpoint "${PC_NS:-ns-pc}" "${PC_IP:-192.168.1.10}"
+        ensure_client_endpoint "${PHONE1_NS:-ns-phone1}" "${PHONE1_IP:-192.168.1.41}"
+        ensure_client_endpoint "${PHONE2_NS:-ns-phone2}" "${PHONE2_IP:-192.168.1.42}"
+    fi
+
+    # Network routing & DSCP preparation for physical Wi-Fi
     if [[ "${eff_mode}" == "physical_single" || "${eff_mode}" == "distributed" ]]; then
         if [[ -n "${DETECTED_WIFI_IF:-}" && -n "${wifi_ip:-}" ]]; then
             # Ensure host route for WAN_SERVER_IP points via DUT gateway over physical Wi-Fi
-            log_cmd "ip route replace ${WAN_SERVER_IP:-10.10.0.1} via ${DUT_LAN_IP:-192.168.1.1} dev ${DETECTED_WIFI_IF}"
-            ip route replace "${WAN_SERVER_IP:-10.10.0.1}" via "${DUT_LAN_IP:-192.168.1.1}" dev "${DETECTED_WIFI_IF}" 2>/dev/null || true
-            CLEANUP_WIFI_ROUTE="${WAN_SERVER_IP:-10.10.0.1} via ${DUT_LAN_IP:-192.168.1.1} dev ${DETECTED_WIFI_IF}"
-            added_wifi_route=1
-
-            # Ensure DSCP 46 (EF = 0xb8) marking on outgoing UDP voice packets for WMM Voice mapping
-            log_cmd "iptables -t mangle -A POSTROUTING -o ${DETECTED_WIFI_IF} -p udp -m multiport --dports ${VOIP_PORTS_LIST} -j DSCP --set-dscp ${VOIP_DSCP_MARK}"
-            iptables -t mangle -A POSTROUTING -o "${DETECTED_WIFI_IF}" -p udp -m multiport --dports "${VOIP_PORTS_LIST}" -j DSCP --set-dscp "${VOIP_DSCP_MARK}" 2>/dev/null || true
-            log_cmd "iptables -t mangle -A POSTROUTING -o ${DETECTED_WIFI_IF} -p udp -m multiport --sports ${VOIP_PORTS_LIST} -j DSCP --set-dscp ${VOIP_DSCP_MARK}"
-            iptables -t mangle -A POSTROUTING -o "${DETECTED_WIFI_IF}" -p udp -m multiport --sports "${VOIP_PORTS_LIST}" -j DSCP --set-dscp "${VOIP_DSCP_MARK}" 2>/dev/null || true
-            CLEANUP_IPTABLES_MANGLE="iptables -t mangle -D POSTROUTING -o ${DETECTED_WIFI_IF} -p udp -m multiport --dports ${VOIP_PORTS_LIST} -j DSCP --set-dscp ${VOIP_DSCP_MARK} 2>/dev/null || true; iptables -t mangle -D POSTROUTING -o ${DETECTED_WIFI_IF} -p udp -m multiport --sports ${VOIP_PORTS_LIST} -j DSCP --set-dscp ${VOIP_DSCP_MARK} 2>/dev/null || true"
-            added_mangle_rule=1
+            station_adapter_bind_route "${DETECTED_WIFI_IF}" "${WAN_SERVER_IP:-10.10.0.1}" "${DUT_LAN_IP:-192.168.1.1}"
+            station_adapter_apply_mangle "${DETECTED_WIFI_IF}" "${VOIP_PORTS_LIST}" "${VOIP_DSCP_MARK}"
         fi
 
         if [[ ( "${eff_mode}" == "remote_only" || "${eff_mode}" == "distributed" ) && -n "${REMOTE_WIFI_IF:-}" ]]; then
@@ -297,7 +245,7 @@ run_phase_voice_qos() {
     log_info "Measuring baseline PC throughput without VoIP calls (A, duration: ${pc_baseline_dur}s)..."
     local pc_base_out="${SCENARIO_TMP_DIR}/iperf_pc_base.json"
     log_cmd "ip netns exec ${PC_NS:-ns-pc} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${VOIP_PORT_IPERF} -t ${pc_baseline_dur} -J > ${pc_base_out}"
-    ip netns exec "${PC_NS:-ns-pc}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${VOIP_PORT_IPERF}" -t "${pc_baseline_dur}" -J > "${pc_base_out}" 2>&1
+    ip netns exec "${PC_NS:-ns-pc}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${VOIP_PORT_IPERF}" -t "${pc_baseline_dur}" -J > "${pc_base_out}" 2>&1 || true
     local a_mbps
     a_mbps="$("${tools_dir}/metric_parser.py" sum-mbps "${pc_base_out}")"
     log_info "  Baseline PC throughput (A): ${a_mbps} Mbps"
@@ -538,15 +486,15 @@ run_phase_voice_qos() {
                     --phone-id "phone-2" || true
 
             else
-                log_cmd "ip netns exec ${PHONE1_NS:-ns-phone1} ${sipp_bin} -sf ${uac_tpl} ${WAN_SERVER_IP:-10.10.0.1}:${VOIP_PORT_SIP_SERVER} -i ${PHONE1_IP:-192.168.1.101} -mi ${PHONE1_IP:-192.168.1.101} -p ${VOIP_PORT_SIP_SERVER} -mp ${VOIP_PORT_RTP_PHONE1} -m 1 -d ${sipp_dur_ms} -nostdin > ${LOG_DIR}/sipp_phone1.log 2>&1 &"
+                log_cmd "ip netns exec ${PHONE1_NS:-ns-phone1} ${sipp_bin} -sf ${uac_tpl} ${WAN_SERVER_IP:-10.10.0.1}:${VOIP_PORT_SIP_SERVER} -i ${PHONE1_IP:-192.168.1.41} -mi ${PHONE1_IP:-192.168.1.41} -p ${VOIP_PORT_SIP_SERVER} -mp ${VOIP_PORT_RTP_PHONE1} -m 1 -d ${sipp_dur_ms} -nostdin > ${LOG_DIR}/sipp_phone1.log 2>&1 &"
                 ip netns exec "${PHONE1_NS:-ns-phone1}" "${sipp_bin}" -sf "${uac_tpl}" "${WAN_SERVER_IP:-10.10.0.1}:${VOIP_PORT_SIP_SERVER}" \
-                    -i "${PHONE1_IP:-192.168.1.101}" -mi "${PHONE1_IP:-192.168.1.101}" -p "${VOIP_PORT_SIP_SERVER}" -mp "${VOIP_PORT_RTP_PHONE1}" -m 1 -d "${sipp_dur_ms}" -nostdin > "${LOG_DIR}/sipp_phone1.log" 2>&1 &
+                    -i "${PHONE1_IP:-192.168.1.41}" -mi "${PHONE1_IP:-192.168.1.41}" -p "${VOIP_PORT_SIP_SERVER}" -mp "${VOIP_PORT_RTP_PHONE1}" -m 1 -d "${sipp_dur_ms}" -nostdin > "${LOG_DIR}/sipp_phone1.log" 2>&1 &
                 phone1_pid=$!
                 ACTIVE_BG_PIDS+=("${phone1_pid}")
 
-                log_cmd "ip netns exec ${PHONE2_NS:-ns-phone2} ${sipp_bin} -sf ${uac_tpl} ${WAN_SERVER_IP:-10.10.0.1}:${VOIP_PORT_SIP_SERVER} -i ${PHONE2_IP:-192.168.1.102} -mi ${PHONE2_IP:-192.168.1.102} -p ${VOIP_PORT_SIP_PHONE1} -mp ${VOIP_PORT_RTP_PHONE2} -m 1 -d ${sipp_dur_ms} -nostdin > ${LOG_DIR}/sipp_phone2.log 2>&1 &"
+                log_cmd "ip netns exec ${PHONE2_NS:-ns-phone2} ${sipp_bin} -sf ${uac_tpl} ${WAN_SERVER_IP:-10.10.0.1}:${VOIP_PORT_SIP_SERVER} -i ${PHONE2_IP:-192.168.1.42} -mi ${PHONE2_IP:-192.168.1.42} -p ${VOIP_PORT_SIP_PHONE1} -mp ${VOIP_PORT_RTP_PHONE2} -m 1 -d ${sipp_dur_ms} -nostdin > ${LOG_DIR}/sipp_phone2.log 2>&1 &"
                 ip netns exec "${PHONE2_NS:-ns-phone2}" "${sipp_bin}" -sf "${uac_tpl}" "${WAN_SERVER_IP:-10.10.0.1}:${VOIP_PORT_SIP_SERVER}" \
-                    -i "${PHONE2_IP:-192.168.1.102}" -mi "${PHONE2_IP:-192.168.1.102}" -p "${VOIP_PORT_SIP_PHONE1}" -mp "${VOIP_PORT_RTP_PHONE2}" -m 1 -d "${sipp_dur_ms}" -nostdin > "${LOG_DIR}/sipp_phone2.log" 2>&1 &
+                    -i "${PHONE2_IP:-192.168.1.42}" -mi "${PHONE2_IP:-192.168.1.42}" -p "${VOIP_PORT_SIP_PHONE1}" -mp "${VOIP_PORT_RTP_PHONE2}" -m 1 -d "${sipp_dur_ms}" -nostdin > "${LOG_DIR}/sipp_phone2.log" 2>&1 &
                 phone2_pid=$!
                 ACTIVE_BG_PIDS+=("${phone2_pid}")
             fi
@@ -610,15 +558,15 @@ run_phase_voice_qos() {
                     --phone-id "phone-2" || true
 
             else
-                log_cmd "ip netns exec ${PHONE1_NS:-ns-phone1} ${sipp_bin} -sn uac ${WAN_SERVER_IP:-10.10.0.1}:${VOIP_PORT_SIP_SERVER} -i ${PHONE1_IP:-192.168.1.101} -mi ${PHONE1_IP:-192.168.1.101} -p ${VOIP_PORT_SIP_SERVER} -mp ${VOIP_PORT_RTP_PHONE1} -m 1 -d ${sipp_dur_ms} -nostdin >/dev/null 2>&1 &"
+                log_cmd "ip netns exec ${PHONE1_NS:-ns-phone1} ${sipp_bin} -sn uac ${WAN_SERVER_IP:-10.10.0.1}:${VOIP_PORT_SIP_SERVER} -i ${PHONE1_IP:-192.168.1.41} -mi ${PHONE1_IP:-192.168.1.41} -p ${VOIP_PORT_SIP_SERVER} -mp ${VOIP_PORT_RTP_PHONE1} -m 1 -d ${sipp_dur_ms} -nostdin >/dev/null 2>&1 &"
                 ip netns exec "${PHONE1_NS:-ns-phone1}" "${sipp_bin}" -sn uac "${WAN_SERVER_IP:-10.10.0.1}:${VOIP_PORT_SIP_SERVER}" \
-                    -i "${PHONE1_IP:-192.168.1.101}" -mi "${PHONE1_IP:-192.168.1.101}" -p "${VOIP_PORT_SIP_SERVER}" -mp "${VOIP_PORT_RTP_PHONE1}" -m 1 -d "${sipp_dur_ms}" -nostdin >/dev/null 2>&1 &
+                    -i "${PHONE1_IP:-192.168.1.41}" -mi "${PHONE1_IP:-192.168.1.41}" -p "${VOIP_PORT_SIP_SERVER}" -mp "${VOIP_PORT_RTP_PHONE1}" -m 1 -d "${sipp_dur_ms}" -nostdin >/dev/null 2>&1 &
                 phone1_pid=$!
                 ACTIVE_BG_PIDS+=("${phone1_pid}")
 
-                log_cmd "ip netns exec ${PHONE2_NS:-ns-phone2} ${sipp_bin} -sn uac ${WAN_SERVER_IP:-10.10.0.1}:${VOIP_PORT_SIP_SERVER} -i ${PHONE2_IP:-192.168.1.102} -mi ${PHONE2_IP:-192.168.1.102} -p ${VOIP_PORT_SIP_PHONE1} -mp ${VOIP_PORT_RTP_PHONE2} -m 1 -d ${sipp_dur_ms} -nostdin >/dev/null 2>&1 &"
+                log_cmd "ip netns exec ${PHONE2_NS:-ns-phone2} ${sipp_bin} -sn uac ${WAN_SERVER_IP:-10.10.0.1}:${VOIP_PORT_SIP_SERVER} -i ${PHONE2_IP:-192.168.1.42} -mi ${PHONE2_IP:-192.168.1.42} -p ${VOIP_PORT_SIP_PHONE1} -mp ${VOIP_PORT_RTP_PHONE2} -m 1 -d ${sipp_dur_ms} -nostdin >/dev/null 2>&1 &"
                 ip netns exec "${PHONE2_NS:-ns-phone2}" "${sipp_bin}" -sn uac "${WAN_SERVER_IP:-10.10.0.1}:${VOIP_PORT_SIP_SERVER}" \
-                    -i "${PHONE2_IP:-192.168.1.102}" -mi "${PHONE2_IP:-192.168.1.102}" -p "${VOIP_PORT_SIP_PHONE1}" -mp "${VOIP_PORT_RTP_PHONE2}" -m 1 -d "${sipp_dur_ms}" -nostdin >/dev/null 2>&1 &
+                    -i "${PHONE2_IP:-192.168.1.42}" -mi "${PHONE2_IP:-192.168.1.42}" -p "${VOIP_PORT_SIP_PHONE1}" -mp "${VOIP_PORT_RTP_PHONE2}" -m 1 -d "${sipp_dur_ms}" -nostdin >/dev/null 2>&1 &
                 phone2_pid=$!
                 ACTIVE_BG_PIDS+=("${phone2_pid}")
             fi
@@ -682,30 +630,36 @@ run_phase_voice_qos() {
                 --phone-id "phone-2" || true
 
         else
-            log_cmd "ip netns exec ${PHONE1_NS:-ns-phone1} ${tools_dir}/voip_call_simulator.py client --server-ip ${WAN_SERVER_IP:-10.10.0.1} --server-port ${VOIP_PORT_RTP_PHONE1} --duration ${call_duration} --phone-id phone-1 &"
-            ip netns exec "${PHONE1_NS:-ns-phone1}" "${tools_dir}/voip_call_simulator.py" client \
+            traffic_run_bg --job "phone1" --netns "${PHONE1_NS:-ns-phone1}" \
+                "${tools_dir}/voip_call_simulator.py" client \
                 --server-ip "${WAN_SERVER_IP:-10.10.0.1}" --server-port "${VOIP_PORT_RTP_PHONE1}" \
-                --duration "${call_duration}" --phone-id "phone-1" >/dev/null 2>&1 &
-            phone1_pid=$!
-            ACTIVE_BG_PIDS+=("${phone1_pid}")
+                --duration "${call_duration}" --phone-id "phone-1"
+            phone1_pid="${TRAFFIC_LAST_PID}"
 
-            log_cmd "ip netns exec ${PHONE2_NS:-ns-phone2} ${tools_dir}/voip_call_simulator.py client --server-ip ${WAN_SERVER_IP:-10.10.0.1} --server-port ${VOIP_PORT_RTP_PHONE2} --duration ${call_duration} --phone-id phone-2 &"
-            ip netns exec "${PHONE2_NS:-ns-phone2}" "${tools_dir}/voip_call_simulator.py" client \
+            traffic_run_bg --job "phone2" --netns "${PHONE2_NS:-ns-phone2}" \
+                "${tools_dir}/voip_call_simulator.py" client \
                 --server-ip "${WAN_SERVER_IP:-10.10.0.1}" --server-port "${VOIP_PORT_RTP_PHONE2}" \
-                --duration "${call_duration}" --phone-id "phone-2" >/dev/null 2>&1 &
-            phone2_pid=$!
-            ACTIVE_BG_PIDS+=("${phone2_pid}")
+                --duration "${call_duration}" --phone-id "phone-2"
+            phone2_pid="${TRAFFIC_LAST_PID}"
         fi
     fi
 
     log_pass "VoIP call media streams active on Wi-Fi client stations."
     sleep 1.0 # Allow calls to establish and stabilize
 
+    # Ensure iperf3 server in ns-wan is ready for concurrent measurement
+    if ns_exists "${WAN_NS:-ns-wan}"; then
+        ip netns exec "${WAN_NS:-ns-wan}" pkill -TERM -x iperf3 2>/dev/null || true
+        sleep 0.2
+        ip netns exec "${WAN_NS:-ns-wan}" iperf3 -s -p "${VOIP_PORT_IPERF}" -D >/dev/null 2>&1
+        sleep 0.2
+    fi
+
     # Step 3: Measure PC Throughput during active calls (B)
     log_info "Measuring PC throughput during 2 active Wi-Fi phone calls (B, duration: ${pc_concurrent_dur}s)..."
     local pc_call_out="${SCENARIO_TMP_DIR}/iperf_pc_call.json"
     log_cmd "ip netns exec ${PC_NS:-ns-pc} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${VOIP_PORT_IPERF} -t ${pc_concurrent_dur} -J > ${pc_call_out}"
-    ip netns exec "${PC_NS:-ns-pc}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${VOIP_PORT_IPERF}" -t "${pc_concurrent_dur}" -J > "${pc_call_out}" 2>&1
+    ip netns exec "${PC_NS:-ns-pc}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${VOIP_PORT_IPERF}" -t "${pc_concurrent_dur}" -J > "${pc_call_out}" 2>&1 || true
     local b_mbps
     b_mbps="$("${tools_dir}/metric_parser.py" sum-mbps "${pc_call_out}")"
     log_info "  Concurrent PC throughput (B): ${b_mbps} Mbps"
@@ -757,13 +711,13 @@ run_phase_voice_qos() {
     if [[ -n "${phone1_pid}" ]]; then pids_to_kill+=("${phone1_pid}"); fi
     if [[ -n "${phone2_pid}" ]]; then pids_to_kill+=("${phone2_pid}"); fi
     if [[ -n "${voip_srv_pid}" ]]; then pids_to_kill+=("${voip_srv_pid}"); fi
-    _voip_terminate_pids "${pids_to_kill[@]}"
+    traffic_stop_group "${pids_to_kill[@]}"
 
     # Stop Targeted Station Packet Captures (LAN / Wi-Fi side)
     local caps_to_kill=()
     if [[ -n "${phone1_cap_pid}" ]]; then caps_to_kill+=("${phone1_cap_pid}"); fi
     if [[ -n "${phone2_cap_pid}" ]]; then caps_to_kill+=("${phone2_cap_pid}"); fi
-    _voip_terminate_pids "${caps_to_kill[@]}"
+    traffic_stop_group "${caps_to_kill[@]}"
 
     if [[ -f "${phone1_pcap}" ]]; then chmod 0666 "${phone1_pcap}" 2>/dev/null || true; fi
     if [[ -f "${phone2_pcap}" ]]; then chmod 0666 "${phone2_pcap}" 2>/dev/null || true; fi
@@ -789,7 +743,7 @@ run_phase_voice_qos() {
     ip netns exec "${WAN_NS:-ns-wan}" pkill -TERM -x iperf3 2>/dev/null || true
 
     # Clean up physical Wi-Fi route and iptables rules
-    _voip_cleanup_network "${added_wifi_route}" "${added_mangle_rule}" "${DETECTED_WIFI_IF:-}"
+    _voip_cleanup_network
 
     local wifi_if_rep="${DETECTED_WIFI_IF:-}"
     local wifi_ssid_rep="${DETECTED_WIFI_SSID:-}"
@@ -812,5 +766,5 @@ run_phase_voice_qos() {
         --output "${voice_json}"
     )
     log_cmd "${eval_cmd[*]}"
-    "${eval_cmd[@]}"
+    "${eval_cmd[@]}" || true
 }

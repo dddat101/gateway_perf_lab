@@ -6,6 +6,15 @@
 # Refactored with Defensive Bash Programming Patterns
 # ==============================================================================
 
+# Defensive bootstrap: auto-source scenario_common.sh if running in standalone test harness
+if ! declare -F terminate_bg_pids >/dev/null 2>&1; then
+    _scn_common_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)/scenario_common.sh"
+    if [[ -f "${_scn_common_lib}" ]]; then
+        source "${_scn_common_lib}"
+    fi
+    unset _scn_common_lib
+fi
+
 # Canonical constants
 readonly APP_DEFAULT_DURATION="5.0"
 readonly APP_DEFAULT_GFN_FPS=60
@@ -79,37 +88,14 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# Process Termination & Clean-up Helpers
+# Process Termination & Clean-up Helpers (Traffic Orchestrator Adapters)
 # ------------------------------------------------------------------------------
 _app_terminate_pids() {
-    local pids=("$@")
-    if (( ${#pids[@]} == 0 )); then
-        return 0
-    fi
-
-    for pid in "${pids[@]}"; do
-        if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
-            kill -TERM "${pid}" 2>/dev/null || true
-        fi
-    done
-
-    sleep 0.2
-
-    for pid in "${pids[@]}"; do
-        if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
-            kill -KILL "${pid}" 2>/dev/null || true
-        fi
-    done
+    traffic_stop_group "$@"
 }
 
 _app_clean_stale() {
-    local pattern="$1"
-    if ns_exists "${STB_NS:-ns-stb}"; then
-        ip netns exec "${STB_NS:-ns-stb}" pkill -TERM -f "${pattern}" 2>/dev/null || true
-    fi
-    if ns_exists "${WAN_NS:-ns-wan}"; then
-        ip netns exec "${WAN_NS:-ns-wan}" pkill -TERM -f "${pattern}" 2>/dev/null || true
-    fi
+    traffic_clean_stale "$@"
 }
 
 # ------------------------------------------------------------------------------
@@ -157,11 +143,11 @@ run_subphase_geforce() {
     gfn_cli_duration="$(awk -v d="${gfn_srv_duration}" 'BEGIN { printf "%.1f", d + 3.0 }')"
 
     # Clean any stale GeForce tester instances
-    _app_clean_stale "geforce_now_tester.py"
+    traffic_clean_stale "geforce_now_tester.py"
     sleep 0.1
 
-    log_cmd "ip netns exec ${STB_NS:-ns-stb} ${tools_dir}/geforce_now_tester.py client --bind-ip 0.0.0.0 --bind-port ${APP_DEFAULT_GFN_PORT} --server-ip ${WAN_SERVER_IP:-10.10.0.1} --server-port ${APP_DEFAULT_GFN_PORT} --duration ${gfn_cli_duration} --max-loss-pct ${GEFORCE_NOW_MAX_LOSS_PCT:-${APP_DEFAULT_GFN_MAX_LOSS}} --max-jitter-ms ${eff_max_jitter} --fps ${eff_fps} --target-mbps ${eff_bitrate} --output-json ${gfn_json} > ${gfn_rx_log} 2>&1 &"
-    ip netns exec "${STB_NS:-ns-stb}" "${tools_dir}/geforce_now_tester.py" client \
+    traffic_run_bg --job "gfn_rx" --netns "${STB_NS:-ns-stb}" --out "${gfn_rx_log}" \
+        "${tools_dir}/geforce_now_tester.py" client \
         --bind-ip "0.0.0.0" --bind-port "${APP_DEFAULT_GFN_PORT}" \
         --server-ip "${WAN_SERVER_IP:-10.10.0.1}" --server-port "${APP_DEFAULT_GFN_PORT}" \
         --duration "${gfn_cli_duration}" \
@@ -169,9 +155,7 @@ run_subphase_geforce() {
         --max-jitter-ms "${eff_max_jitter}" \
         --fps "${eff_fps}" \
         --target-mbps "${eff_bitrate}" \
-        --output-json "${gfn_json}" > "${gfn_rx_log}" 2>&1 &
-    local gfn_rx_pid=$!
-    ACTIVE_BG_PIDS+=("${gfn_rx_pid}")
+        --output-json "${gfn_json}"
     sleep 0.3
 
     log_cmd "ip netns exec ${WAN_NS:-ns-wan} ${tools_dir}/geforce_now_tester.py server --dest-ip ${STB_IP:-192.168.1.20} --dest-port ${APP_DEFAULT_GFN_PORT} --wait-handshake --duration ${gfn_srv_duration} --frame-rate ${eff_fps} --bitrate-mbps ${eff_bitrate}"
@@ -181,8 +165,7 @@ run_subphase_geforce() {
         --duration "${gfn_srv_duration}" \
         --frame-rate "${eff_fps}" --bitrate-mbps "${eff_bitrate}" || true
 
-    wait "${gfn_rx_pid}" 2>/dev/null || true
-    _app_terminate_pids "${gfn_rx_pid}"
+    traffic_wait_all "gfn_rx"
 
     if [[ -f "${gfn_json}" ]]; then
         log_cmd "${tools_dir}/metric_parser.py format-card ${gfn_json}"
@@ -219,17 +202,15 @@ run_subphase_vod() {
     vod_cli_duration="$(awk -v d="${vod_srv_duration}" 'BEGIN { printf "%.1f", d + 4.0 }')"
 
     # Clean any stale VOD tester instances
-    _app_clean_stale "vod_stream_tester.py"
+    traffic_clean_stale "vod_stream_tester.py"
     sleep 0.1
 
-    log_cmd "ip netns exec ${STB_NS:-ns-stb} ${tools_dir}/vod_stream_tester.py client --bind-ip 0.0.0.0 --bind-port ${APP_DEFAULT_VOD_PORT} --server-ip ${WAN_SERVER_IP:-10.10.0.1} --server-port ${APP_DEFAULT_VOD_PORT} --duration ${vod_cli_duration} --output-json ${vod_json} > ${vod_rx_log} 2>&1 &"
-    ip netns exec "${STB_NS:-ns-stb}" "${tools_dir}/vod_stream_tester.py" client \
+    traffic_run_bg --job "vod_rx" --netns "${STB_NS:-ns-stb}" --out "${vod_rx_log}" \
+        "${tools_dir}/vod_stream_tester.py" client \
         --bind-ip "0.0.0.0" --bind-port "${APP_DEFAULT_VOD_PORT}" \
         --server-ip "${WAN_SERVER_IP:-10.10.0.1}" --server-port "${APP_DEFAULT_VOD_PORT}" \
         --duration "${vod_cli_duration}" \
-        --output-json "${vod_json}" > "${vod_rx_log}" 2>&1 &
-    local vod_rx_pid=$!
-    ACTIVE_BG_PIDS+=("${vod_rx_pid}")
+        --output-json "${vod_json}"
     sleep 0.3
 
     log_cmd "ip netns exec ${WAN_NS:-ns-wan} ${tools_dir}/vod_stream_tester.py server --dest-ip ${STB_IP:-192.168.1.20} --dest-port ${APP_DEFAULT_VOD_PORT} --wait-handshake --duration ${vod_srv_duration} --base-bitrate-mbps ${VOD_BASE_BITRATE_MBPS:-${APP_DEFAULT_VOD_BASE_BITRATE}} --playback-speed ${VOD_SPEED_MULTIPLIER:-${APP_DEFAULT_VOD_SPEED_MULTIPLIER}}"
@@ -240,8 +221,7 @@ run_subphase_vod() {
         --base-bitrate-mbps "${VOD_BASE_BITRATE_MBPS:-${APP_DEFAULT_VOD_BASE_BITRATE}}" \
         --playback-speed "${VOD_SPEED_MULTIPLIER:-${APP_DEFAULT_VOD_SPEED_MULTIPLIER}}" || true
 
-    wait "${vod_rx_pid}" 2>/dev/null || true
-    _app_terminate_pids "${vod_rx_pid}"
+    traffic_wait_all "vod_rx"
 
     if [[ -f "${vod_json}" ]]; then
         log_cmd "${tools_dir}/metric_parser.py format-card ${vod_json}"

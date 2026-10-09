@@ -193,7 +193,13 @@ setup_virtual_topology() {
             ip link del dev "${dev_dut}" 2>/dev/null || true
         fi
 
-        ip link add name "${dev_dut}" type veth peer name "veth-client"
+        local last_oct="${ip_addr##*.}"
+        local hex_oct
+        hex_oct="$(printf '%02x' "${last_oct:-10}")"
+        local client_mac="02:00:00:00:01:${hex_oct}"
+        local dut_mac="02:00:00:00:02:${hex_oct}"
+
+        ip link add name "${dev_dut}" address "${dut_mac}" type veth peer name "veth-client" address "${client_mac}"
         ip link set "${dev_dut}" netns "${DUT_NS:-ns-dut}"
         ip link set "veth-client" netns "${client_ns}"
 
@@ -333,7 +339,12 @@ setup_physical_topology() {
         ns_create "${client_ns}"
         if ! iface_exists_ns "${client_ns}" "eth0"; then
             ip link del dev "${host_dev}" 2>/dev/null || true
-            ip link add "${host_dev}" type veth peer name "eth0" netns "${client_ns}"
+            local last_oct="${client_ip##*.}"
+            local hex_oct
+            hex_oct="$(printf '%02x' "${last_oct:-10}")"
+            local client_mac="02:00:00:00:01:${hex_oct}"
+            local host_mac="02:00:00:00:02:${hex_oct}"
+            ip link add "${host_dev}" address "${host_mac}" type veth peer name "eth0" address "${client_mac}" netns "${client_ns}"
         fi
         ip link set dev "${host_dev}" master "${LAN_BRIDGE:-br-test-lan}"
         ip link set dev "${host_dev}" up

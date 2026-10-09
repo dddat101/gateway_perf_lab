@@ -19,96 +19,14 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from wqos_measurement import audit_captures, load_json, EvidenceError
-
-
-def run_tshark_count(pcap_path: str, display_filter: str) -> int:
-    """Count packets matching display filter in PCAP using tshark via stdin (AppArmor-safe)."""
-    if not pcap_path or not Path(pcap_path).is_file():
-        return 0
-
-    cmd = [
-        "tshark", "-r", "-",
-        "-Y", display_filter,
-        "-T", "fields", "-e", "frame.number"
-    ]
-    try:
-        with open(pcap_path, "rb") as f:
-            proc = subprocess.run(cmd, stdin=f, capture_output=True, text=True, check=False)
-        lines = [line for line in proc.stdout.strip().splitlines() if line.strip()]
-        return len(lines)
-    except Exception:
-        return 0
-
-
-def run_tshark_sum_bytes(pcap_path: str, display_filter: str) -> int:
-    """Sum frame lengths matching display filter in PCAP using tshark via stdin (AppArmor-safe)."""
-    if not pcap_path or not Path(pcap_path).is_file():
-        return 0
-
-    cmd = [
-        "tshark", "-r", "-",
-        "-Y", display_filter,
-        "-T", "fields", "-e", "frame.len"
-    ]
-    try:
-        with open(pcap_path, "rb") as f:
-            proc = subprocess.run(cmd, stdin=f, capture_output=True, text=True, check=False)
-        total = sum(int(line.strip()) for line in proc.stdout.strip().splitlines() if line.strip().isdigit())
-        return total
-    except Exception:
-        return 0
-
-
-def parse_rtp_streams(pcap_path: str, decode_ports: List[int]) -> List[Dict[str, Any]]:
-    """Extract RTP stream statistics using tshark via stdin (AppArmor-safe)."""
-    if not pcap_path or not Path(pcap_path).is_file():
-        return []
-
-    cmd = ["tshark"]
-    for port in decode_ports:
-        cmd.extend(["-d", f"udp.port=={port},rtp"])
-    cmd.extend(["-r", "-", "-q", "-z", "rtp,streams"])
-
-    try:
-        with open(pcap_path, "rb") as f:
-            proc = subprocess.run(cmd, stdin=f, capture_output=True, text=True, check=False)
-        output = proc.stdout
-    except Exception:
-        return []
-
-    streams = []
-    lines = output.splitlines()
-    in_table = False
-    for line in lines:
-        if "== RTP Streams ==" in line:
-            in_table = True
-            continue
-        if in_table and line.startswith("="):
-            continue
-        if in_table and line.strip():
-            parts = line.split()
-            if len(parts) >= 14:
-                try:
-                    pkts = int(parts[8])
-                    lost_str = parts[9]
-                    mean_delta = float(parts[12]) if len(parts) > 12 else 0.0
-                    mean_jitter = float(parts[15]) if len(parts) > 15 else 0.0
-                    streams.append({
-                        "src_ip": parts[2],
-                        "src_port": int(parts[3]),
-                        "dst_ip": parts[4],
-                        "dst_port": int(parts[5]),
-                        "ssrc": parts[6],
-                        "payload": parts[7],
-                        "packets": pkts,
-                        "lost_str": lost_str,
-                        "mean_delta_ms": mean_delta,
-                        "mean_jitter_ms": mean_jitter
-                    })
-                except (ValueError, IndexError):
-                    continue
-    return streams
+from evidence_auditor import (
+    EvidenceError,
+    audit_captures,
+    load_json,
+    parse_rtp_streams,
+    run_tshark_count,
+    run_tshark_sum_bytes,
+)
 
 
 

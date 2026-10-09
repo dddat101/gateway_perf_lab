@@ -16,79 +16,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from evidence_auditor import run_tshark_count, parse_rtp_streams, VoipStreamAuditor
 
-def run_tshark_count(pcap_path: str, display_filter: str) -> int:
-    """Count packets matching a display filter in a PCAP file using tshark via stdin (AppArmor-safe)."""
-    if not pcap_path or not Path(pcap_path).is_file():
-        return 0
-
-    cmd = [
-        "tshark", "-r", "-",
-        "-Y", display_filter,
-        "-T", "fields", "-e", "frame.number"
-    ]
-    try:
-        with open(pcap_path, "rb") as f:
-            proc = subprocess.run(cmd, stdin=f, capture_output=True, text=True, check=False)
-        lines = [line for line in proc.stdout.strip().splitlines() if line.strip()]
-        return len(lines)
-    except Exception:
-        return 0
-
-
-def parse_rtp_streams(pcap_path: str, decode_ports: List[int]) -> List[Dict[str, Any]]:
-    """
-    Extract RTP stream statistics (packets, lost, delta, jitter) using tshark -z rtp,streams via stdin (AppArmor-safe).
-    """
-    if not pcap_path or not Path(pcap_path).is_file():
-        return []
-
-    cmd = ["tshark"]
-    for port in decode_ports:
-        cmd.extend(["-d", f"udp.port=={port},rtp"])
-    cmd.extend(["-r", "-", "-q", "-z", "rtp,streams"])
-
-    try:
-        with open(pcap_path, "rb") as f:
-            proc = subprocess.run(cmd, stdin=f, capture_output=True, text=True, check=False)
-        output = proc.stdout
-    except Exception:
-        return []
-
-    streams = []
-    lines = output.splitlines()
-    in_table = False
-    for line in lines:
-        if "== RTP Streams ==" in line:
-            in_table = True
-            continue
-        if in_table and line.startswith("="):
-            continue
-        if in_table and line.strip():
-            parts = line.split()
-            # Expected columns:
-            # Start(0), End(1), SrcIP(2), SrcPort(3), DstIP(4), DstPort(5), SSRC(6), Payload(7), Pkts(8), Lost(9), ...
-            if len(parts) >= 14:
-                try:
-                    pkts = int(parts[8])
-                    lost_str = parts[9]
-                    mean_delta = float(parts[12]) if len(parts) > 12 else 0.0
-                    mean_jitter = float(parts[15]) if len(parts) > 15 else 0.0
-                    streams.append({
-                        "src_ip": parts[2],
-                        "src_port": int(parts[3]),
-                        "dst_ip": parts[4],
-                        "dst_port": int(parts[5]),
-                        "ssrc": parts[6],
-                        "payload": parts[7],
-                        "packets": pkts,
-                        "lost_str": lost_str,
-                        "mean_delta_ms": mean_delta,
-                        "mean_jitter_ms": mean_jitter
-                    })
-                except (ValueError, IndexError):
-                    continue
-    return streams
 
 
 def audit_stream(
@@ -237,26 +166,28 @@ def main() -> int:
                 p2_label = "Phone 2 (Remote Wi-Fi)" if "remote" in p2_pcap.lower() else "Phone 2 (Wi-Fi)"
 
         # Phone 1 Uplink (LAN -> WAN)
-        p1_up_client = next((s for s in p1_streams if s['src_port'] == 10000 or (s['dst_port'] == 10000 and s.get('dst_ip') == '10.10.0.1')), None)
-        p1_up_wan = next((s for s in wan_streams if s['src_port'] == 10000 and s.get('dst_ip') == '10.10.0.1'), None)
+        p1_up_client = next((s for s in p1_streams if s.get('src_ip') != '10.10.0.1' and (s.get('dst_ip') == '10.10.0.1' or s['dst_port'] == 10000 or s['src_port'] == 10000)), None)
+        p1_up_wan = next((s for s in wan_streams if s.get('src_ip') != '10.10.0.1' and (s.get('dst_ip') == '10.10.0.1' and s.get('src_port') == 10000 or s.get('src_ip') == '192.168.1.41')), None)
+        if not p1_up_wan:
+            p1_up_wan = next((s for s in wan_streams if s.get('src_ip') != '10.10.0.1' and s['src_port'] == 10000), None)
         if p1_up_client or p1_up_wan:
             streams_audit.append(_create_stream_entry(p1_label, "Uplink (LAN->WAN)", p1_up_client, p1_up_wan, p1_dscp46 > 0 or wan_dscp46 > 0))
 
         # Phone 1 Downlink (WAN -> LAN)
-        p1_down_wan = next((s for s in wan_streams if s.get('src_ip') == '10.10.0.1' and s['dst_port'] == 10000), None)
-        p1_down_client = next((s for s in p1_streams if s.get('src_ip') == '10.10.0.1' and s['dst_port'] == 10000), None)
+        p1_down_wan = next((s for s in wan_streams if s.get('src_ip') == '10.10.0.1' and (s['dst_port'] == 10000 or s.get('dst_ip') == '192.168.1.41')), None)
+        p1_down_client = next((s for s in p1_streams if s.get('src_ip') == '10.10.0.1' and (s['dst_port'] == 10000 or s.get('dst_ip') == '192.168.1.41')), None)
         if p1_down_wan or p1_down_client:
             streams_audit.append(_create_stream_entry(p1_label, "Downlink (WAN->LAN)", p1_down_wan, p1_down_client, wan_dscp46 > 0 or p1_dscp46 > 0))
 
         # Phone 2 Uplink (LAN -> WAN)
-        p2_up_client = next((s for s in p2_streams if s['src_port'] == 10002 or (s['dst_port'] == 10000 and s['src_port'] == 10002)), None)
-        p2_up_wan = next((s for s in wan_streams if s['src_port'] == 10002 and s.get('dst_ip') == '10.10.0.1'), None)
+        p2_up_client = next((s for s in p2_streams if s.get('src_ip') != '10.10.0.1' and (s['src_port'] == 10002 or s['dst_port'] == 10002 or s.get('src_ip') == '192.168.1.42')), None)
+        p2_up_wan = next((s for s in wan_streams if s.get('src_ip') != '10.10.0.1' and (s['src_port'] == 10002 or s['dst_port'] == 10002 or s.get('src_ip') == '192.168.1.42')), None)
         if p2_up_client or p2_up_wan:
             streams_audit.append(_create_stream_entry(p2_label, "Uplink (LAN->WAN)", p2_up_client, p2_up_wan, p2_dscp46 > 0 or wan_dscp46 > 0))
 
         # Phone 2 Downlink (WAN -> LAN)
-        p2_down_wan = next((s for s in wan_streams if s.get('src_ip') == '10.10.0.1' and s['dst_port'] == 10002), None)
-        p2_down_client = next((s for s in p2_streams if s.get('src_ip') == '10.10.0.1' and s['dst_port'] == 10002), None)
+        p2_down_wan = next((s for s in wan_streams if s.get('src_ip') == '10.10.0.1' and (s['dst_port'] == 10002 or s.get('dst_ip') == '192.168.1.42')), None)
+        p2_down_client = next((s for s in p2_streams if s.get('src_ip') == '10.10.0.1' and (s['dst_port'] == 10002 or s.get('dst_ip') == '192.168.1.42')), None)
         if p2_down_wan or p2_down_client:
             streams_audit.append(_create_stream_entry(p2_label, "Downlink (WAN->LAN)", p2_down_wan, p2_down_client, wan_dscp46 > 0 or p2_dscp46 > 0))
 

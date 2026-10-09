@@ -150,6 +150,24 @@ print_namespaces_section() {
             v_ip="${WAN_SERVER_IP:-10.10.0.1}"
             v_gw="-"
             v_status="UP"
+        elif [[ "${ns}" == "${DUT_NS:-ns-dut}" ]]; then
+            if is_root; then
+                local lan_ip wan_ip
+                lan_ip="$(ip -n "${ns}" -4 -o addr show dev br-lan 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || echo "")"
+                wan_ip="$(ip -n "${ns}" -4 -o addr show dev eth-wan 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || echo "")"
+                v_gw="$(ip -n "${ns}" -4 route show default 2>/dev/null | awk '{print $3}' | head -n1 || echo "")"
+                if [[ -n "${lan_ip}" ]]; then
+                    v_ip="${lan_ip}"
+                    v_status="UP"
+                elif [[ -n "${wan_ip}" ]]; then
+                    v_ip="${wan_ip}"
+                    v_status="UP"
+                fi
+            else
+                v_ip="${DUT_LAN_IP:-192.168.1.1}"
+                v_gw="${WAN_SERVER_IP:-10.10.0.1}"
+                v_status="UP"
+            fi
         elif is_root; then
             v_ip="$(ip -n "${ns}" -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || echo "")"
             v_gw="$(ip -n "${ns}" -4 route show default 2>/dev/null | awk '{print $3}' | head -n1 || echo "")"
@@ -168,7 +186,11 @@ print_namespaces_section() {
         [[ -z "${v_gw}" ]] && v_gw="-"
 
         local medium="veth: ${veth_h}"
-        [[ -z "${veth_h}" || "${veth_h}" == "-" ]] && medium="netns link"
+        if [[ "${ns}" == "${DUT_NS:-ns-dut}" ]]; then
+            medium="br-lan + eth-wan"
+        elif [[ -z "${veth_h}" || "${veth_h}" == "-" ]]; then
+            medium="netns link"
+        fi
 
         local ssid_disp="-"
         if [[ -n "${target_ssid}" && "${target_ssid}" != "-" ]]; then
@@ -323,7 +345,13 @@ print_namespaces_section() {
             ip netns exec "${ns}" ip -br -6 addr show 2>/dev/null | awk '{printf "    [IPv6] %-10s %s\n", $1, $3}' || true
             ip netns exec "${ns}" ip -4 route show 2>/dev/null | awk '{printf "    v4 route: %s\n", $0}' || true
             ip netns exec "${ns}" ip -6 route show default 2>/dev/null | awk '{printf "    v6 route: %s\n", $0}' || true
-            if [[ "${ns}" == "${DUT_NS:-ns-dut}" ]] || [[ "${ns}" == "${STB_NS:-ns-stb}" ]]; then
+            if [[ "${ns}" == "${DUT_NS:-ns-dut}" ]]; then
+                local tc_wan tc_stb
+                tc_wan="$(ip netns exec "${ns}" tc qdisc show dev eth-wan 2>/dev/null || true)"
+                [[ -n "${tc_wan}" ]] && printf '    tc qdisc (eth-wan): %s\n' "${tc_wan}"
+                tc_stb="$(ip netns exec "${ns}" tc qdisc show dev veth-dut-stb 2>/dev/null || true)"
+                [[ -n "${tc_stb}" ]] && printf '    tc qdisc (veth-dut-stb): %s\n' "${tc_stb}"
+            elif [[ "${ns}" == "${STB_NS:-ns-stb}" ]]; then
                 local tc_info
                 tc_info="$(ip netns exec "${ns}" tc qdisc show dev eth0 2>/dev/null || true)"
                 [[ -n "${tc_info}" ]] && printf '    tc qdisc: %s\n' "${tc_info}"
@@ -341,6 +369,9 @@ print_namespaces_section() {
             if [[ "${ns}" == "${WAN_NS:-ns-wan}" ]]; then
                 cur_ip="${WAN_SERVER_IP:-10.10.0.1}"
                 cur_gw="-"
+            elif [[ "${ns}" == "${DUT_NS:-ns-dut}" ]]; then
+                cur_ip="${DUT_LAN_IP:-192.168.1.1}"
+                cur_gw="${WAN_SERVER_IP:-10.10.0.1}"
             else
                 cur_ip="$(awk '/lease of/{ip=$4} END{print ip}' "${LOG_DIR}/udhcpc-${ns}.log" 2>/dev/null || echo "")"
                 cur_gw="$(awk '/lease of/{gw=$7} END{print gw}' "${LOG_DIR}/udhcpc-${ns}.log" 2>/dev/null | tr -d ',' || echo "")"

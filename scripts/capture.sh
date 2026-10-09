@@ -658,10 +658,12 @@ compare_captures() {
         local p="$1"
         local flt="${2:-}"
         if [[ ! -f "${p}" ]]; then echo "0 0"; return; fi
+        local d_flt
+        d_flt="$(bpf_to_display_filter "${flt}")"
         local res=""
-        if [[ -n "${flt}" ]]; then
-            log_cmd "cat \"${p}\" | ${TSHARK_BIN:-tshark} -r - -n -q -z \"io,stat,0,${flt}\""
-            res="$(cat "${p}" 2>/dev/null | "${TSHARK_BIN:-tshark}" -r - -n -q -z "io,stat,0,${flt}" 2>/dev/null | awk -F'|' '/<>/ {gsub(/[ \t]/, "", $3); gsub(/[ \t]/, "", $4); print $3, $4}' || true)"
+        if [[ -n "${d_flt}" ]]; then
+            log_cmd "cat \"${p}\" | ${TSHARK_BIN:-tshark} -r - -n -q -z \"io,stat,0,${d_flt}\""
+            res="$(cat "${p}" 2>/dev/null | "${TSHARK_BIN:-tshark}" -r - -n -q -z "io,stat,0,${d_flt}" 2>/dev/null | awk -F'|' '/<>/ {gsub(/[ \t]/, "", $3); gsub(/[ \t]/, "", $4); print $3, $4}' || true)"
         else
             log_cmd "cat \"${p}\" | ${TSHARK_BIN:-tshark} -r - -n -q -z \"io,stat,0\""
             res="$(cat "${p}" 2>/dev/null | "${TSHARK_BIN:-tshark}" -r - -n -q -z "io,stat,0" 2>/dev/null | awk -F'|' '/<>/ {gsub(/[ \t]/, "", $3); gsub(/[ \t]/, "", $4); print $3, $4}' || true)"
@@ -672,7 +674,7 @@ compare_captures() {
         fi
         if [[ -z "${frames}" || ! "${frames}" =~ ^[0-9]+$ ]]; then
             local -a extra=()
-            if [[ -n "${flt}" ]]; then extra+=("-Y" "${flt}"); fi
+            if [[ -n "${d_flt}" ]]; then extra+=("-Y" "${d_flt}"); fi
             frames="$(cat "${p}" 2>/dev/null | "${TSHARK_BIN:-tshark}" -r - "${extra[@]}" -T fields -e frame.number 2>/dev/null | wc -l || echo "0")"
             bytes="0"
         fi
@@ -854,13 +856,19 @@ compare_captures() {
     printf '  ------------------------------------------------------------------\n'
 
     if command -v "${TSHARK_BIN:-tshark}" >/dev/null 2>&1; then
+        local disp_filter
+        disp_filter="$(bpf_to_display_filter "${filter}")"
         if [[ -n "${filter}" ]]; then
-            printf '  Applied Filter            : %s\n' "${filter}"
+            if [[ -n "${disp_filter}" && "${disp_filter}" != "${filter}" ]]; then
+                printf '  Applied Filter            : %s (Display: %s)\n' "${filter}" "${disp_filter}"
+            else
+                printf '  Applied Filter            : %s\n' "${filter}"
+            fi
         fi
 
         local stats_wan stats_lan
-        stats_wan="$(get_stats "${wan_pcap}" "${filter}")"
-        stats_lan="$(get_stats "${lan_pcap}" "${filter}")"
+        stats_wan="$(get_stats "${wan_pcap}" "${disp_filter}")"
+        stats_lan="$(get_stats "${lan_pcap}" "${disp_filter}")"
 
         local count_wan="0" count_lan="0" bytes_wan="0" bytes_lan="0"
         IFS=' ' read -r count_wan bytes_wan <<< "${stats_wan}"
@@ -900,8 +908,8 @@ compare_captures() {
             if [[ -x "${correlator_bin}" ]]; then
                 local corr_json="${LOG_DIR:-logs}/pcap_correlation_${tag,,}.json"
                 local -a corr_args=("${correlator_bin}" "--wan" "${wan_pcap}" "--lan" "${lan_pcap}")
-                if [[ -n "${filter}" ]]; then
-                    corr_args+=("--filter" "${filter}")
+                if [[ -n "${disp_filter}" ]]; then
+                    corr_args+=("--filter" "${disp_filter}")
                 fi
                 corr_args+=("--output-json" "${corr_json}")
                 "${corr_args[@]}" || true

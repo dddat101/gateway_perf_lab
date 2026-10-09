@@ -7,6 +7,15 @@
 # Refactored with Defensive Bash Programming Patterns
 # ==============================================================================
 
+# Defensive bootstrap: auto-source scenario_common.sh if running in standalone test harness
+if ! declare -F terminate_bg_pids >/dev/null 2>&1; then
+    _scn_common_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)/scenario_common.sh"
+    if [[ -f "${_scn_common_lib}" ]]; then
+        source "${_scn_common_lib}"
+    fi
+    unset _scn_common_lib
+fi
+
 # Canonical constants
 readonly RM_DEFAULT_TARGET_SPEED=100
 readonly RM_DEFAULT_GIGABIT_SPEED=1000
@@ -78,27 +87,11 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# Process Termination Helper (Escalating SIGTERM -> SIGKILL)
+# ------------------------------------------------------------------------------
+# Modular Helper: Terminate PIDs safely via centralized traffic orchestrator
 # ------------------------------------------------------------------------------
 _rm_terminate_pids() {
-    local pids=("$@")
-    if (( ${#pids[@]} == 0 )); then
-        return 0
-    fi
-
-    for pid in "${pids[@]}"; do
-        if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
-            kill -TERM "${pid}" 2>/dev/null || true
-        fi
-    done
-
-    sleep 0.2
-
-    for pid in "${pids[@]}"; do
-        if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
-            kill -KILL "${pid}" 2>/dev/null || true
-        fi
-    done
+    traffic_stop_group "$@"
 }
 
 # ------------------------------------------------------------------------------
@@ -290,14 +283,12 @@ run_subphase_burst_case1() {
     ensure_client_endpoint "${STB_NS:-ns-stb}" "${STB_IP:-192.168.1.20}"
     local c1_rx_log="${SCENARIO_TMP_DIR}/burst_c1_rx.log"
 
-    log_cmd "ip netns exec ${STB_NS:-ns-stb} ${tools_dir}/traffic_generator.py burst-recv --bind-ip 0.0.0.0 --bind-port ${RM_DEFAULT_RX_PORT} --server-ip ${WAN_SERVER_IP:-10.10.0.1} --server-port ${RM_DEFAULT_TX_PORT} --expected-packets ${c1_expected} --timeout ${RM_DEFAULT_TIMEOUT} --output-json ${c1_json} > ${c1_rx_log} 2>&1 &"
-    ip netns exec "${STB_NS:-ns-stb}" "${tools_dir}/traffic_generator.py" burst-recv \
+    traffic_run_bg --job "c1_rx" --netns "${STB_NS:-ns-stb}" --out "${c1_rx_log}" \
+        "${tools_dir}/traffic_generator.py" burst-recv \
         --bind-ip "0.0.0.0" --bind-port "${RM_DEFAULT_RX_PORT}" \
         --server-ip "${WAN_SERVER_IP:-10.10.0.1}" --server-port "${RM_DEFAULT_TX_PORT}" \
         --expected-packets "${c1_expected}" --timeout "${RM_DEFAULT_TIMEOUT}" \
-        --output-json "${c1_json}" > "${c1_rx_log}" 2>&1 &
-    local c1_rx_pid=$!
-    ACTIVE_BG_PIDS+=("${c1_rx_pid}")
+        --output-json "${c1_json}"
     sleep 0.3
 
     log_cmd "ip netns exec ${WAN_NS:-ns-wan} ${tools_dir}/traffic_generator.py burst-send --dest-ip ${STB_IP:-192.168.1.20} --dest-port ${RM_DEFAULT_RX_PORT} --bind-port ${RM_DEFAULT_TX_PORT} --wait-handshake --packet-size ${pkt_size} --burst-length ${c1_frames} --burst-load ${c1_load} --burst-count ${c1_count} --rate-mbps ${RM_DEFAULT_RATE_MBPS}"
@@ -307,8 +298,7 @@ run_subphase_burst_case1() {
         --packet-size "${pkt_size}" --burst-length "${c1_frames}" \
         --burst-load "${c1_load}" --burst-count "${c1_count}" --rate-mbps "${RM_DEFAULT_RATE_MBPS}" || true
 
-    wait "${c1_rx_pid}" 2>/dev/null || true
-    _rm_terminate_pids "${c1_rx_pid}"
+    traffic_wait_all "c1_rx"
 
     if [[ -f "${c1_json}" ]]; then
         log_cmd "${tools_dir}/metric_parser.py format-card ${c1_json}"
@@ -356,14 +346,12 @@ run_subphase_burst_case2() {
     ensure_client_endpoint "${STB_NS:-ns-stb}" "${STB_IP:-192.168.1.20}"
     local c2_rx_log="${SCENARIO_TMP_DIR}/burst_c2_rx.log"
 
-    log_cmd "ip netns exec ${STB_NS:-ns-stb} ${tools_dir}/traffic_generator.py burst-recv --bind-ip 0.0.0.0 --bind-port ${RM_DEFAULT_RX_PORT} --server-ip ${WAN_SERVER_IP:-10.10.0.1} --server-port ${RM_DEFAULT_TX_PORT} --expected-packets ${c2_expected} --timeout ${RM_DEFAULT_TIMEOUT} --output-json ${c2_json} > ${c2_rx_log} 2>&1 &"
-    ip netns exec "${STB_NS:-ns-stb}" "${tools_dir}/traffic_generator.py" burst-recv \
+    traffic_run_bg --job "c2_rx" --netns "${STB_NS:-ns-stb}" --out "${c2_rx_log}" \
+        "${tools_dir}/traffic_generator.py" burst-recv \
         --bind-ip "0.0.0.0" --bind-port "${RM_DEFAULT_RX_PORT}" \
         --server-ip "${WAN_SERVER_IP:-10.10.0.1}" --server-port "${RM_DEFAULT_TX_PORT}" \
         --expected-packets "${c2_expected}" --timeout "${RM_DEFAULT_TIMEOUT}" \
-        --output-json "${c2_json}" > "${c2_rx_log}" 2>&1 &
-    local c2_rx_pid=$!
-    ACTIVE_BG_PIDS+=("${c2_rx_pid}")
+        --output-json "${c2_json}"
     sleep 0.3
 
     log_cmd "ip netns exec ${WAN_NS:-ns-wan} ${tools_dir}/traffic_generator.py burst-send --dest-ip ${STB_IP:-192.168.1.20} --dest-port ${RM_DEFAULT_RX_PORT} --bind-port ${RM_DEFAULT_TX_PORT} --wait-handshake --packet-size ${pkt_size} --burst-length ${c2_frames} --burst-load ${c2_load} --burst-count ${c2_count} --rate-mbps ${RM_DEFAULT_RATE_MBPS}"
@@ -373,8 +361,7 @@ run_subphase_burst_case2() {
         --packet-size "${pkt_size}" --burst-length "${c2_frames}" \
         --burst-load "${c2_load}" --burst-count "${c2_count}" --rate-mbps "${RM_DEFAULT_RATE_MBPS}" || true
 
-    wait "${c2_rx_pid}" 2>/dev/null || true
-    _rm_terminate_pids "${c2_rx_pid}"
+    traffic_wait_all "c2_rx"
 
     if [[ -f "${c2_json}" ]]; then
         log_cmd "${tools_dir}/metric_parser.py format-card ${c2_json}"

@@ -4,6 +4,18 @@
 # Shared Trap Handlers, Dual Packet Capture Orchestrator, & Endpoint Setup
 # ==============================================================================
 
+# Source centralized Traffic Process Supervisor and Running Mode Orchestrator
+_SCN_COMMON_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ -f "${_SCN_COMMON_DIR}/traffic_orchestrator.sh" ]]; then
+    # shellcheck source=lib/traffic_orchestrator.sh
+    source "${_SCN_COMMON_DIR}/traffic_orchestrator.sh"
+fi
+if [[ -f "${_SCN_COMMON_DIR}/orchestrator_mode.sh" ]]; then
+    # shellcheck source=lib/orchestrator_mode.sh
+    source "${_SCN_COMMON_DIR}/orchestrator_mode.sh"
+fi
+unset _SCN_COMMON_DIR
+
 # Defensive cleanup trap: cleans up temporary directory, background PIDs, and active captures
 cleanup_scenario_trap() {
     local exit_code=$?
@@ -15,13 +27,9 @@ cleanup_scenario_trap() {
         "${SCRIPT_DIR}/capture.sh" stop 2>/dev/null || true
     fi
 
-    # Terminate any tracked background jobs
+    # Terminate any tracked background jobs cleanly
     if (( ${#ACTIVE_BG_PIDS[@]} > 0 )); then
-        for pid in "${ACTIVE_BG_PIDS[@]}"; do
-            if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-                kill -KILL "${pid}" 2>/dev/null || true
-            fi
-        done
+        terminate_bg_pids "${ACTIVE_BG_PIDS[@]}"
         ACTIVE_BG_PIDS=()
     fi
 
@@ -39,6 +47,9 @@ cleanup_scenario_trap() {
     fi
 
     # Defensive cleanup of physical Wi-Fi test route and iptables mangle rule
+    if declare -F station_adapter_release >/dev/null 2>&1; then
+        station_adapter_release 2>/dev/null || true
+    fi
     if [[ -n "${CLEANUP_WIFI_ROUTE:-}" ]]; then
         ip route del ${CLEANUP_WIFI_ROUTE} 2>/dev/null || true
     fi
@@ -198,6 +209,26 @@ ensure_client_endpoint() {
     elif [[ "${ns}" == "${PC_NS:-ns-pc}" ]]; then
         PC_IP="${curr_ip}"
         export PC_IP
+    fi
+
+    # Enforce deterministic unique MAC address to prevent bridge MAC flapping
+    if [[ -n "${curr_ip}" ]]; then
+        local last_oct="${curr_ip##*.}"
+        local hex_oct
+        hex_oct="$(printf '%02x' "${last_oct}")"
+        local expected_mac="02:00:00:00:01:${hex_oct}"
+        local curr_mac
+        curr_mac="$(ip -n "${ns}" link show dev eth0 2>/dev/null | awk '/link\/ether/ {print $2}' || true)"
+        if [[ -n "${curr_mac}" && "${curr_mac}" != "${expected_mac}" ]]; then
+            log_info "Correcting MAC address on ${ns}:eth0 (${curr_mac} -> ${expected_mac})..."
+            ip -n "${ns}" link set dev eth0 down 2>/dev/null || true
+            ip -n "${ns}" link set dev eth0 address "${expected_mac}" 2>/dev/null || true
+            ip -n "${ns}" link set dev eth0 up 2>/dev/null || true
+            if ns_exists "${DUT_NS:-ns-dut}"; then
+                ip netns exec "${DUT_NS:-ns-dut}" bridge fdb flush dev br-lan 2>/dev/null || true
+                ip -n "${DUT_NS:-ns-dut}" neigh flush all 2>/dev/null || true
+            fi
+        fi
     fi
 
     # Ensure default route exists via DUT LAN IP to route traffic to WAN

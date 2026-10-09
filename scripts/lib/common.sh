@@ -588,3 +588,29 @@ write_state_env() {
     mv -f "${temp_file}" "${target_file}"
 }
 
+# 11. BPF to Wireshark Display Filter Converter
+bpf_to_display_filter() {
+    local f="${1:-}"
+    if [[ -z "${f}" ]]; then
+        return 0
+    fi
+    # If already a Wireshark display filter (contains field dots, or comparison operators)
+    if [[ "${f}" =~ (\.(port|addr|dst|src|proto|len)|==|!=|<=|>=) ]]; then
+        printf '%s' "${f}"
+        return 0
+    fi
+
+    # 1. 'udp port <N>' or 'tcp port <N>' -> 'udp.port == <N>' or 'tcp.port == <N>'
+    f="$(sed -E 's/\b(udp|tcp)\s+port\s+([0-9]+)/\1.port == \2/g' <<< "${f}")"
+    # 2. generic 'port <N>' -> '(tcp.port == <N> || udp.port == <N>)'
+    f="$(sed -E 's/\bport\s+([0-9]+)/(tcp.port == \1 || udp.port == \1)/g' <<< "${f}")"
+    # 3. 'host <ip>' -> 'ip.addr == <ip>'
+    f="$(sed -E 's/\bhost\s+([0-9.]+)/ip.addr == \1/g' <<< "${f}")"
+    # 4. 'src <ip>' -> 'ip.src == <ip>', 'dst <ip>' -> 'ip.dst == <ip>'
+    f="$(sed -E 's/\bsrc\s+([0-9.]+)/ip.src == \1/g; s/\bdst\s+([0-9.]+)/ip.dst == \1/g' <<< "${f}")"
+    # 5. Logical operators: 'or' -> '||', 'and' -> '&&'
+    f="$(sed -E 's/\bor\b/||/g; s/\band\b/\&\&/g' <<< "${f}")"
+
+    printf '%s' "${f}"
+}
+

@@ -6,6 +6,15 @@
 # Refactored with Defensive Bash Programming Patterns
 # ==============================================================================
 
+# Defensive bootstrap: auto-source scenario_common.sh if running in standalone test harness
+if ! declare -F terminate_bg_pids >/dev/null 2>&1; then
+    _scn_common_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)/scenario_common.sh"
+    if [[ -f "${_scn_common_lib}" ]]; then
+        source "${_scn_common_lib}"
+    fi
+    unset _scn_common_lib
+fi
+
 # Canonical constants
 readonly WR_DEFAULT_DURATION=10
 readonly WR_DEFAULT_BITRATE="950M"
@@ -83,25 +92,11 @@ EOF
 # ------------------------------------------------------------------------------
 # Modular Helper: Terminate PIDs safely with escalation (TERM -> KILL)
 # ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Modular Helper: Terminate PIDs safely via centralized traffic orchestrator
+# ------------------------------------------------------------------------------
 _wr_terminate_pids() {
-    local -a pids=("$@")
-    if (( ${#pids[@]} == 0 )); then
-        return 0
-    fi
-
-    for pid in "${pids[@]}"; do
-        if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
-            kill -TERM "${pid}" 2>/dev/null || true
-        fi
-    done
-
-    sleep 0.2
-
-    for pid in "${pids[@]}"; do
-        if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
-            kill -KILL "${pid}" 2>/dev/null || true
-        fi
-    done
+    traffic_stop_group "$@"
 }
 
 # ------------------------------------------------------------------------------
@@ -205,18 +200,13 @@ run_subphase_unicast() {
             ip netns exec "${WAN_NS:-ns-wan}" iperf3 -s -p "${rev_port}" -D >/dev/null 2>&1
             sleep 0.4
 
-            log_cmd "${remote_script} run-iperf -c ${WAN_SERVER_IP:-10.10.0.1} --bind-dev ${rem_dev} -u -p ${fwd_port} -b ${unicast_rate} -l 982 -w ${sock_buf} -t ${duration} -O ${omit_sec} -R -J > ${fwd_out} 2>&1 &"
-            "${remote_script}" run-iperf -c "${WAN_SERVER_IP:-10.10.0.1}" --bind-dev "${rem_dev}" -u -p "${fwd_port}" -b "${unicast_rate}" -l 982 -w "${sock_buf}" -t "${duration}" -O "${omit_sec}" -R -J > "${fwd_out}" 2>&1 &
-            local fwd_pid=$!
-            ACTIVE_BG_PIDS+=("${fwd_pid}")
+            traffic_run_bg --job "fwd" --out "${fwd_out}" \
+                "${remote_script}" run-iperf -c "${WAN_SERVER_IP:-10.10.0.1}" --bind-dev "${rem_dev}" -u -p "${fwd_port}" -b "${unicast_rate}" -l 982 -w "${sock_buf}" -t "${duration}" -O "${omit_sec}" -R -J
+            traffic_run_bg --job "rev" --out "${rev_out}" \
+                "${remote_script}" run-iperf -c "${WAN_SERVER_IP:-10.10.0.1}" --bind-dev "${rem_dev}" -u -p "${rev_port}" -b "${unicast_rate}" -l 982 -w "${sock_buf}" -t "${duration}" -O "${omit_sec}" -J
 
-            log_cmd "${remote_script} run-iperf -c ${WAN_SERVER_IP:-10.10.0.1} --bind-dev ${rem_dev} -u -p ${rev_port} -b ${unicast_rate} -l 982 -w ${sock_buf} -t ${duration} -O ${omit_sec} -J > ${rev_out} 2>&1 &"
-            "${remote_script}" run-iperf -c "${WAN_SERVER_IP:-10.10.0.1}" --bind-dev "${rem_dev}" -u -p "${rev_port}" -b "${unicast_rate}" -l 982 -w "${sock_buf}" -t "${duration}" -O "${omit_sec}" -J > "${rev_out}" 2>&1 &
-            local rev_pid=$!
-            ACTIVE_BG_PIDS+=("${rev_pid}")
-
-            wait "${fwd_pid}" "${rev_pid}" 2>/dev/null || true
-            ip netns exec "${WAN_NS:-ns-wan}" pkill -TERM -x iperf3 2>/dev/null || true
+            traffic_wait_all "fwd" "rev"
+            traffic_clean_stale --netns "${WAN_NS:-ns-wan}" "iperf3"
 
         elif [[ "${unicast_mode}" == "concurrent" ]]; then
             log_info "Executing CONCURRENT Full-Duplex Forward (port ${fwd_port}) + Reverse (port ${rev_port}) for ${duration}s (omit ${omit_sec}s warm-up)..."
@@ -228,18 +218,13 @@ run_subphase_unicast() {
             ip netns exec "${WAN_NS:-ns-wan}" iperf3 -s -p "${rev_port}" -D >/dev/null 2>&1
             sleep 0.4
 
-            log_cmd "ip netns exec ${PC_NS:-ns-pc} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -u -p ${fwd_port} -b ${unicast_rate} -l 982 -w ${sock_buf} -t ${duration} -O ${omit_sec} -R -J > ${fwd_out} 2>&1 &"
-            ip netns exec "${PC_NS:-ns-pc}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -u -p "${fwd_port}" -b "${unicast_rate}" -l 982 -w "${sock_buf}" -t "${duration}" -O "${omit_sec}" -R -J > "${fwd_out}" 2>&1 &
-            local fwd_pid=$!
-            ACTIVE_BG_PIDS+=("${fwd_pid}")
+            traffic_run_bg --job "fwd" --netns "${PC_NS:-ns-pc}" --out "${fwd_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -u -p "${fwd_port}" -b "${unicast_rate}" -l 982 -w "${sock_buf}" -t "${duration}" -O "${omit_sec}" -R -J
+            traffic_run_bg --job "rev" --netns "${PC_NS:-ns-pc}" --out "${rev_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -u -p "${rev_port}" -b "${unicast_rate}" -l 982 -w "${sock_buf}" -t "${duration}" -O "${omit_sec}" -J
 
-            log_cmd "ip netns exec ${PC_NS:-ns-pc} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -u -p ${rev_port} -b ${unicast_rate} -l 982 -w ${sock_buf} -t ${duration} -O ${omit_sec} -J > ${rev_out} 2>&1 &"
-            ip netns exec "${PC_NS:-ns-pc}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -u -p "${rev_port}" -b "${unicast_rate}" -l 982 -w "${sock_buf}" -t "${duration}" -O "${omit_sec}" -J > "${rev_out}" 2>&1 &
-            local rev_pid=$!
-            ACTIVE_BG_PIDS+=("${rev_pid}")
-
-            wait "${fwd_pid}" "${rev_pid}" 2>/dev/null || true
-            ip netns exec "${WAN_NS:-ns-wan}" pkill -TERM -x iperf3 2>/dev/null || true
+            traffic_wait_all "fwd" "rev"
+            traffic_clean_stale --netns "${WAN_NS:-ns-wan}" "iperf3"
 
         elif (( is_remote == 1 )); then
             log_info "Executing SEQUENTIAL Bidirectional Wire-rate (Forward then Reverse) for ${duration}s each on Remote PC [${rem_dev}]..."
@@ -294,7 +279,7 @@ run_subphase_unicast() {
             --forward "${fwd_out}" \
             --reverse "${rev_out}" \
             --mode "${unicast_mode}" \
-            --output "${uni_json}"
+            --output "${uni_json}" || true
     else
         log_info "Using native zero-allocation Python engine: traffic_generator.py..."
         local py_dur=$(( duration > 4 ? duration : 4 ))
@@ -337,25 +322,20 @@ run_subphase_multicast() {
     fi
 
     # Start IGMP proxy forwarder in DUT namespace if simulated
-    local mcast_fwd_pid=""
     if ns_exists "${DUT_NS:-ns-dut}"; then
-        log_cmd "ip netns exec ${DUT_NS:-ns-dut} ${tools_dir}/mcast_forwarder.py --group-ip ${mcast_group} --port ${WR_DEFAULT_MCAST_PORT} --wan-if-ip ${DUT_WAN_IP:-10.10.0.100} --lan-if-ip ${DUT_LAN_IP:-192.168.1.1} --duration 12.0 >/dev/null 2>&1 &"
-        ip netns exec "${DUT_NS:-ns-dut}" "${tools_dir}/mcast_forwarder.py" \
+        traffic_run_bg --job "mcast_fwd" --netns "${DUT_NS:-ns-dut}" \
+            "${tools_dir}/mcast_forwarder.py" \
             --group-ip "${mcast_group}" --port "${WR_DEFAULT_MCAST_PORT}" \
             --wan-if-ip "${DUT_WAN_IP:-10.10.0.100}" --lan-if-ip "${DUT_LAN_IP:-192.168.1.1}" \
-            --duration 12.0 >/dev/null 2>&1 &
-        mcast_fwd_pid=$!
-        ACTIVE_BG_PIDS+=("${mcast_fwd_pid}")
+            --duration 12.0
         sleep 0.2
     fi
 
     # Start multicast receiver in STB namespace
-    log_cmd "ip netns exec ${STB_NS:-ns-stb} ${tools_dir}/traffic_generator.py mcast-recv --group-ip ${mcast_group} --port ${WR_DEFAULT_MCAST_PORT} --expected-packets ${WR_DEFAULT_MCAST_PACKETS} --timeout 5.0 --output-json ${mcast_json} >/dev/null 2>&1 &"
-    ip netns exec "${STB_NS:-ns-stb}" "${tools_dir}/traffic_generator.py" mcast-recv \
+    traffic_run_bg --job "mcast_rx" --netns "${STB_NS:-ns-stb}" \
+        "${tools_dir}/traffic_generator.py" mcast-recv \
         --group-ip "${mcast_group}" --port "${WR_DEFAULT_MCAST_PORT}" \
-        --expected-packets "${WR_DEFAULT_MCAST_PACKETS}" --timeout 5.0 --output-json "${mcast_json}" >/dev/null 2>&1 &
-    local mcast_rx_pid=$!
-    ACTIVE_BG_PIDS+=("${mcast_rx_pid}")
+        --expected-packets "${WR_DEFAULT_MCAST_PACKETS}" --timeout 5.0 --output-json "${mcast_json}"
     sleep 1.0
 
     # Start multicast sender in WAN namespace with warmup burst to trigger HW flow cache
@@ -366,11 +346,8 @@ run_subphase_multicast() {
         --rate-mbps "${WR_DEFAULT_MCAST_RATE}" \
         --warmup-packets 30
 
-    wait "${mcast_rx_pid}" 2>/dev/null || true
-
-    if [[ -n "${mcast_fwd_pid}" ]]; then
-        _wr_terminate_pids "${mcast_fwd_pid}"
-    fi
+    traffic_wait_all "mcast_rx"
+    traffic_stop_group "mcast_fwd"
 
     if [[ -f "${mcast_json}" ]]; then
         log_cmd "${tools_dir}/metric_parser.py format-card ${mcast_json}"

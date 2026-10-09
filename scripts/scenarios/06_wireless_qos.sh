@@ -6,6 +6,15 @@
 # Refactored with Defensive Bash Programming Patterns
 # ==============================================================================
 
+# Defensive bootstrap: auto-source scenario_common.sh if running in standalone test harness
+if ! declare -F terminate_bg_pids >/dev/null 2>&1; then
+    _scn_common_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)/scenario_common.sh"
+    if [[ -f "${_scn_common_lib}" ]]; then
+        source "${_scn_common_lib}"
+    fi
+    unset _scn_common_lib
+fi
+
 # Canonical constants
 readonly WQOS_PORT_VOICE=10000
 readonly WQOS_PORT_VIDEO=5005
@@ -159,30 +168,10 @@ _wqos_calc_stream_bitrate() {
 }
 
 # ------------------------------------------------------------------------------
-# Modular Helper: Terminate PIDs safely with escalation (TERM -> KILL)
+# Modular Helper: Terminate PIDs safely via centralized traffic orchestrator
 # ------------------------------------------------------------------------------
 _wqos_terminate_pids() {
-    local -a pids=("$@")
-    if (( ${#pids[@]} == 0 )); then
-        return 0
-    fi
-
-    # 1. Graceful SIGTERM
-    for pid in "${pids[@]}"; do
-        if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
-            kill -TERM "${pid}" 2>/dev/null || true
-        fi
-    done
-
-    # 2. Brief grace period for socket/file buffer flush
-    sleep 0.3
-
-    # 3. Escalate to SIGKILL for any lingering processes
-    for pid in "${pids[@]}"; do
-        if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
-            kill -KILL "${pid}" 2>/dev/null || true
-        fi
-    done
+    traffic_stop_group "$@"
 }
 
 # ------------------------------------------------------------------------------
@@ -192,48 +181,14 @@ _wqos_detect_endpoints() {
     local tools_dir="$1"
     local raw_mode="${CUSTOM_WIFI_MODE:-auto}"
 
-    # 1. Inspect local host Wi-Fi interface and connectivity
-    local env_dump
-    env_dump="$("${tools_dir}/wifi_inspector.py" export-env --check-ping "${DUT_LAN_IP:-192.168.1.1}" 2>/dev/null || true)"
-    eval "${env_dump}"
+    # 1. Resolve canonical execution plan via Running Context Resolver
+    orchestrator_resolve_context
+    local eff_mode="${PLAN_WQOS_MODE:-virtual}"
 
     local wifi_if="${DETECTED_WIFI_IF:-wlp3s0}"
     local wifi_ip="${DETECTED_WIFI_IP:-}"
     if [[ -z "${wifi_ip}" ]]; then
         wifi_ip="$(ip -4 -o addr show dev "${wifi_if}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)"
-    fi
-
-    # 2. Mode resolution logic with fallback guarantees
-    local eff_mode="${raw_mode}"
-    if [[ "${eff_mode}" == "auto" ]]; then
-        if [[ "${TOPOLOGY_MODE:-virtual}" == "virtual" ]]; then
-            eff_mode="virtual"
-        elif (( ${WIFI_CARD_COUNT:-0} == 0 )); then
-            if [[ -n "${REMOTE_CLIENT_HOST:-}" ]] && "${SCRIPT_DIR}/remote_client.sh" test >/dev/null 2>&1; then
-                eff_mode="remote_only"
-            else
-                eff_mode="virtual"
-            fi
-        elif [[ -z "${DETECTED_WIFI_SSID:-}" ]]; then
-            local rem_ip=""
-            if [[ -n "${REMOTE_CLIENT_HOST:-}" ]] && "${SCRIPT_DIR}/remote_client.sh" test >/dev/null 2>&1; then
-                rem_ip="$("${SCRIPT_DIR}/remote_client.sh" wifi-ip 2>/dev/null || true)"
-            fi
-            if [[ -n "${rem_ip}" && "${rem_ip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                eff_mode="remote_only"
-            else
-                log_warn "Physical Wi-Fi not connected on local or remote PC. Falling back to virtual netns."
-                eff_mode="virtual"
-            fi
-        else
-            eff_mode="physical_single"
-        fi
-    elif [[ "${eff_mode}" == "real_single" || "${eff_mode}" == "real_single_band" ]]; then
-        eff_mode="physical_single"
-    elif [[ "${eff_mode}" == "remote" || "${eff_mode}" == "remote_only" ]]; then
-        eff_mode="remote_only"
-    elif [[ "${eff_mode}" == "emulated" ]]; then
-        eff_mode="virtual"
     fi
 
     # 3. Endpoint details extraction
@@ -348,14 +303,7 @@ _wqos_setup_network_qos() {
 # Modular Helper: Teardown QoS Mangle Rules & Routing
 # ------------------------------------------------------------------------------
 _wqos_teardown_network_qos() {
-    if [[ -n "${CLEANUP_WIFI_ROUTE:-}" ]]; then
-        ip route del ${CLEANUP_WIFI_ROUTE} 2>/dev/null || true
-        CLEANUP_WIFI_ROUTE=""
-    fi
-    if [[ -n "${CLEANUP_IPTABLES_MANGLE:-}" ]]; then
-        eval "${CLEANUP_IPTABLES_MANGLE}" 2>/dev/null || true
-        CLEANUP_IPTABLES_MANGLE=""
-    fi
+    station_adapter_release
     if [[ -n "${CLEANUP_WAN_MANGLE:-}" ]]; then
         eval "${CLEANUP_WAN_MANGLE}" 2>/dev/null || true
         CLEANUP_WAN_MANGLE=""
@@ -766,11 +714,11 @@ run_phase_wireless_qos() {
     fi
 
     # 7. Escalated Process Termination (TERM -> KILL)
-    _wqos_terminate_pids "${voice_cli_pid}" "${video_cli_pid}" "${voice_srv_pid}" "${video_srv_pid}"
-    ip netns exec "${WAN_NS:-ns-wan}" pkill -TERM -x iperf3 2>/dev/null || true
+    traffic_stop_group "${voice_cli_pid}" "${video_cli_pid}" "${voice_srv_pid}" "${video_srv_pid}"
+    traffic_clean_stale --netns "${WAN_NS:-ns-wan}" "iperf3"
 
     if [[ -n "${wifi_cap_pid}" ]]; then
-        _wqos_terminate_pids "${wifi_cap_pid}"
+        traffic_stop_group "${wifi_cap_pid}"
         chmod 0666 "${wifi_pcap}" 2>/dev/null || true
     fi
 

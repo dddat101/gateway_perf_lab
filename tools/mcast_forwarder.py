@@ -41,7 +41,7 @@ def main():
     # Join multicast group on WAN interface
     mreq = struct.pack("4s4s", socket.inet_aton(args.group_ip), socket.inet_aton(args.wan_if_ip))
     rx_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-    rx_sock.settimeout(0.5)
+    rx_sock.settimeout(0.1)
 
     # 2. Sender socket on LAN interface
     tx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)

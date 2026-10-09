@@ -6,6 +6,15 @@
 # Refactored with Defensive Bash Programming Patterns
 # ==============================================================================
 
+# Defensive bootstrap: auto-source scenario_common.sh if running in standalone test harness
+if ! declare -F terminate_bg_pids >/dev/null 2>&1; then
+    _scn_common_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)/scenario_common.sh"
+    if [[ -f "${_scn_common_lib}" ]]; then
+        source "${_scn_common_lib}"
+    fi
+    unset _scn_common_lib
+fi
+
 # Canonical constants
 readonly SIM_DEFAULT_TRIALS=5
 readonly SIM_DEFAULT_DURATION="3"
@@ -62,33 +71,14 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# Process Supervision & Server Helpers
+# Process Supervision & Server Helpers (Traffic Orchestrator Adapters)
 # ------------------------------------------------------------------------------
 _sim_terminate_pids() {
-    local pids=("$@")
-    if (( ${#pids[@]} == 0 )); then
-        return 0
-    fi
-
-    for pid in "${pids[@]}"; do
-        if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
-            kill -TERM "${pid}" 2>/dev/null || true
-        fi
-    done
-
-    sleep 0.2
-
-    for pid in "${pids[@]}"; do
-        if [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
-            kill -KILL "${pid}" 2>/dev/null || true
-        fi
-    done
+    traffic_stop_group "$@"
 }
 
 _sim_stop_servers() {
-    if ns_exists "${WAN_NS:-ns-wan}"; then
-        ip netns exec "${WAN_NS:-ns-wan}" pkill -TERM -x iperf3 2>/dev/null || true
-    fi
+    traffic_clean_stale --netns "${WAN_NS:-ns-wan}" "iperf3"
 }
 
 _sim_start_servers() {
@@ -163,18 +153,12 @@ run_single_band_trials() {
         local sim_pc_out="${SCENARIO_TMP_DIR}/iperf_sim_pc_${band_tag}_${i}.json"
         local sim_wifi_out="${SCENARIO_TMP_DIR}/iperf_sim_wifi_${band_tag}_${i}.json"
 
-        log_cmd "ip netns exec ${PC_NS:-ns-pc} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIRED} -t ${duration} -J > ${sim_pc_out} &"
-        ip netns exec "${PC_NS:-ns-pc}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIRED}" -t "${duration}" -J > "${sim_pc_out}" 2>&1 &
-        local sp0=$!
-        ACTIVE_BG_PIDS+=("${sp0}")
+        traffic_run_bg --job "sp0" --netns "${PC_NS:-ns-pc}" --out "${sim_pc_out}" \
+            iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIRED}" -t "${duration}" -J
+        traffic_run_bg --job "sp1" --out "${sim_wifi_out}" \
+            iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" --bind-dev "${wifi_if}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J
 
-        log_cmd "iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} --bind-dev ${wifi_if} -p ${SIM_PORT_WIFI1} -t ${duration} -J > ${sim_wifi_out} &"
-        iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" --bind-dev "${wifi_if}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J > "${sim_wifi_out}" 2>&1 &
-        local sp1=$!
-        ACTIVE_BG_PIDS+=("${sp1}")
-
-        wait "${sp0}" "${sp1}" 2>/dev/null || true
-        _sim_terminate_pids "${sp0}" "${sp1}"
+        traffic_wait_all "sp0" "sp1"
         sleep 0.2
 
         local c_wired c_wifi c_val
@@ -208,7 +192,7 @@ run_single_band_trials() {
         "--trials-c-wired" "${c_wired_str}"
         "--trials-c-wifi" "${c_wifi_str}"
     )
-    "${eval_cmd[@]}"
+    "${eval_cmd[@]}" || true
 }
 
 # ------------------------------------------------------------------------------
@@ -287,18 +271,12 @@ run_remote_station_trials() {
         local sim_pc_out="${SCENARIO_TMP_DIR}/iperf_sim_pc_remote_${i}.json"
         local sim_wifi_out="${SCENARIO_TMP_DIR}/iperf_sim_wifi_remote_${i}.json"
 
-        log_cmd "ip netns exec ${PC_NS:-ns-pc} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIRED} -t ${duration} -J > ${sim_pc_out} &"
-        ip netns exec "${PC_NS:-ns-pc}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIRED}" -t "${duration}" -J > "${sim_pc_out}" 2>&1 &
-        local sp0=$!
-        ACTIVE_BG_PIDS+=("${sp0}")
+        traffic_run_bg --job "sp0" --netns "${PC_NS:-ns-pc}" --out "${sim_pc_out}" \
+            iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIRED}" -t "${duration}" -J
+        traffic_run_bg --job "sp1" --out "${sim_wifi_out}" \
+            "${remote_script}" run-iperf -c "${WAN_SERVER_IP:-10.10.0.1}" "${bind_opt[@]}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J
 
-        log_cmd "${remote_script} run-iperf -c ${WAN_SERVER_IP:-10.10.0.1} ${bind_opt[*]} -p ${SIM_PORT_WIFI1} -t ${duration} -J > ${sim_wifi_out} &"
-        "${remote_script}" run-iperf -c "${WAN_SERVER_IP:-10.10.0.1}" "${bind_opt[@]}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J > "${sim_wifi_out}" 2>&1 &
-        local sp1=$!
-        ACTIVE_BG_PIDS+=("${sp1}")
-
-        wait "${sp0}" "${sp1}" 2>/dev/null || true
-        _sim_terminate_pids "${sp0}" "${sp1}"
+        traffic_wait_all "sp0" "sp1"
         sleep 0.2
 
         local c_wired c_wifi c_val
@@ -332,7 +310,7 @@ run_remote_station_trials() {
         "--trials-c-wired" "${c_wired_str}"
         "--trials-c-wifi" "${c_wifi_str}"
     )
-    "${eval_cmd[@]}"
+    "${eval_cmd[@]}" || true
 }
 
 # ------------------------------------------------------------------------------
@@ -403,18 +381,12 @@ run_tri_station_trials() {
         local w5g_out="${SCENARIO_TMP_DIR}/iperf_w5g_a_${i}.json"
         local w2g_out="${SCENARIO_TMP_DIR}/iperf_w2g_a_${i}.json"
 
-        log_cmd "iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} --bind-dev ${local_wifi_if} -p ${SIM_PORT_WIFI1} -t ${duration} -J > ${w5g_out} &"
-        iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" --bind-dev "${local_wifi_if}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J > "${w5g_out}" 2>&1 &
-        local ap0=$!
-        ACTIVE_BG_PIDS+=("${ap0}")
+        traffic_run_bg --job "ap0" --out "${w5g_out}" \
+            iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" --bind-dev "${local_wifi_if}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J
+        traffic_run_bg --job "ap1" --out "${w2g_out}" \
+            "${remote_script}" run-iperf -c "${WAN_SERVER_IP:-10.10.0.1}" "${bind_opt[@]}" -p "${SIM_PORT_WIFI2}" -t "${duration}" -J
 
-        log_cmd "${remote_script} run-iperf -c ${WAN_SERVER_IP:-10.10.0.1} ${bind_opt[*]} -p ${SIM_PORT_WIFI2} -t ${duration} -J > ${w2g_out} &"
-        "${remote_script}" run-iperf -c "${WAN_SERVER_IP:-10.10.0.1}" "${bind_opt[@]}" -p "${SIM_PORT_WIFI2}" -t "${duration}" -J > "${w2g_out}" 2>&1 &
-        local ap1=$!
-        ACTIVE_BG_PIDS+=("${ap1}")
-
-        wait "${ap0}" "${ap1}" 2>/dev/null || true
-        _sim_terminate_pids "${ap0}" "${ap1}"
+        traffic_wait_all "ap0" "ap1"
         sleep 0.2
 
         local a5g_val a2g_val a_sum
@@ -439,23 +411,14 @@ run_tri_station_trials() {
         local sim_w5g_out="${SCENARIO_TMP_DIR}/iperf_sim_w5g_${i}.json"
         local sim_w2g_out="${SCENARIO_TMP_DIR}/iperf_sim_w2g_${i}.json"
 
-        log_cmd "ip netns exec ${PC_NS:-ns-pc} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIRED} -t ${duration} -J > ${sim_pc_out} &"
-        ip netns exec "${PC_NS:-ns-pc}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIRED}" -t "${duration}" -J > "${sim_pc_out}" 2>&1 &
-        local sp0=$!
-        ACTIVE_BG_PIDS+=("${sp0}")
+        traffic_run_bg --job "sp0" --netns "${PC_NS:-ns-pc}" --out "${sim_pc_out}" \
+            iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIRED}" -t "${duration}" -J
+        traffic_run_bg --job "sp1" --out "${sim_w5g_out}" \
+            iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" --bind-dev "${local_wifi_if}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J
+        traffic_run_bg --job "sp2" --out "${sim_w2g_out}" \
+            "${remote_script}" run-iperf -c "${WAN_SERVER_IP:-10.10.0.1}" "${bind_opt[@]}" -p "${SIM_PORT_WIFI2}" -t "${duration}" -J
 
-        log_cmd "iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} --bind-dev ${local_wifi_if} -p ${SIM_PORT_WIFI1} -t ${duration} -J > ${sim_w5g_out} &"
-        iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" --bind-dev "${local_wifi_if}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J > "${sim_w5g_out}" 2>&1 &
-        local sp1=$!
-        ACTIVE_BG_PIDS+=("${sp1}")
-
-        log_cmd "${remote_script} run-iperf -c ${WAN_SERVER_IP:-10.10.0.1} ${bind_opt[*]} -p ${SIM_PORT_WIFI2} -t ${duration} -J > ${sim_w2g_out} &"
-        "${remote_script}" run-iperf -c "${WAN_SERVER_IP:-10.10.0.1}" "${bind_opt[@]}" -p "${SIM_PORT_WIFI2}" -t "${duration}" -J > "${sim_w2g_out}" 2>&1 &
-        local sp2=$!
-        ACTIVE_BG_PIDS+=("${sp2}")
-
-        wait "${sp0}" "${sp1}" "${sp2}" 2>/dev/null || true
-        _sim_terminate_pids "${sp0}" "${sp1}" "${sp2}"
+        traffic_wait_all "sp0" "sp1" "sp2"
         sleep 0.2
 
         local c_wired c_w5g c_w2g c_wifi_tot c_val
@@ -493,7 +456,7 @@ run_tri_station_trials() {
         "--trials-c-wifi" "${c_wifi_str}"
     )
     log_cmd "${eval_cmd[*]}"
-    "${eval_cmd[@]}"
+    "${eval_cmd[@]}" || true
 }
 
 # ------------------------------------------------------------------------------
@@ -513,36 +476,19 @@ run_phase_simultaneous() {
         duration="${SIM_DEFAULT_DURATION}"
     fi
 
-    # Step 0: Probe Wi-Fi environment and determine execution mode
-    local env_dump
-    env_dump="$("${tools_dir}/wifi_inspector.py" export-env 2>/dev/null || true)"
-    eval "${env_dump}"
+    # Step 0: Resolve canonical execution plan via Running Context Resolver
+    orchestrator_resolve_context
+    local eff_mode="${PLAN_SIM_MODE:-emulated}"
+    orchestrator_show_plan "TC-SIM-01 Simultaneous Download"
 
-    local eff_mode="${CUSTOM_WIFI_MODE:-${WIFI_TEST_MODE:-auto}}"
-    if [[ "${eff_mode}" == "auto" ]]; then
-        if [[ "${TOPOLOGY_MODE:-virtual}" == "virtual" ]]; then
-            eff_mode="emulated"
-        elif (( ${WIFI_CARD_COUNT:-0} == 0 )); then
-            eff_mode="emulated"
-        elif (( ${WIFI_CARD_COUNT:-0} == 1 )); then
-            if [[ -n "${DETECTED_WIFI_SSID:-}" ]]; then
-                eff_mode="real_single_band"
-            else
-                log_warn "Physical Wi-Fi card detected (${DETECTED_WIFI_IF}) but not connected to SSID. Falling back to emulated netns."
-                eff_mode="emulated"
-            fi
-        else
-            eff_mode="physical"
-        fi
-    elif [[ "${eff_mode}" == "real_single" ]]; then
-        eff_mode="real_single_band"
-    elif [[ "${eff_mode}" == "sequential" || "${eff_mode}" == "sequential_bands" || "${eff_mode}" == "multiband" ]]; then
-        eff_mode="sequential"
-    elif [[ "${eff_mode}" == "remote" || "${eff_mode}" == "distributed" || "${eff_mode}" == "remote_client" ]]; then
-        eff_mode="remote"
-    elif [[ "${eff_mode}" == "tri_station" || "${eff_mode}" == "tri_stream" || "${eff_mode}" == "concurrent" || "${eff_mode}" == "distributed_3way" ]]; then
-        eff_mode="tri_station"
-    fi
+    _sim_setup_wifi_route() {
+        if (( DRY_RUN == 1 )); then return 0; fi
+        station_adapter_acquire
+    }
+
+    _sim_cleanup_wifi_route() {
+        station_adapter_release
+    }
 
     # --------------------------------------------------------------------------
     # Case 1: Sequential Multi-Band Testing (5GHz -> 2.4GHz)
@@ -561,6 +507,7 @@ run_phase_simultaneous() {
         fi
 
         _sim_start_servers
+        _sim_setup_wifi_route
 
         # Determine bands to test: 5GHz first (already connected), then 2.4GHz
         local bands_to_test=()
@@ -591,6 +538,7 @@ run_phase_simultaneous() {
                 log_info "Switching physical Wi-Fi [${DETECTED_WIFI_IF}] to ${b_name} (SSID: '${b_ssid}')..."
                 log_cmd "${SCRIPT_DIR}/wifi_connect.sh connect ${b_tag} --force"
                 "${SCRIPT_DIR}/wifi_connect.sh" connect "${b_tag}" --force
+                _sim_setup_wifi_route
                 sleep 2
             else
                 log_info "Physical Wi-Fi [${DETECTED_WIFI_IF}] is already associated to ${b_name} (SSID: '${b_ssid}')."
@@ -610,6 +558,7 @@ run_phase_simultaneous() {
         "${SCRIPT_DIR}/wifi_connect.sh" connect 5g --force >/dev/null 2>&1 || true
 
         _sim_stop_servers
+        _sim_cleanup_wifi_route
 
         # Consolidate results across all tested bands
         local seq_json="${LOG_DIR}/simultaneous_sequential_benchmark.json"
@@ -620,7 +569,7 @@ run_phase_simultaneous() {
             --output "${seq_json}"
         )
         log_cmd "${seq_cmd[*]}"
-        "${seq_cmd[@]}"
+        "${seq_cmd[@]}" || true
 
         # Mirror to simultaneous_benchmark.json for backward compatibility
         cp -f "${seq_json}" "${sim_json}" 2>/dev/null || true
@@ -675,8 +624,10 @@ run_phase_simultaneous() {
         fi
 
         _sim_start_servers
+        _sim_setup_wifi_route
         run_tri_station_trials
         _sim_stop_servers
+        _sim_cleanup_wifi_route
         return 0
     fi
 
@@ -697,8 +648,10 @@ run_phase_simultaneous() {
         fi
 
         _sim_start_servers
+        _sim_setup_wifi_route
         run_single_band_trials "single" "${DETECTED_WIFI_BAND:-5GHz}" "${DETECTED_WIFI_SSID:-DUT}" "${DETECTED_WIFI_IF}" "${sim_json}"
         _sim_stop_servers
+        _sim_cleanup_wifi_route
         return 0
     fi
 
@@ -720,6 +673,9 @@ run_phase_simultaneous() {
     fi
 
     _sim_start_servers
+    if [[ "${eff_mode}" == "hybrid" ]]; then
+        _sim_setup_wifi_route
+    fi
 
     local a_trials=()
     local b_trials=()
@@ -737,23 +693,14 @@ run_phase_simultaneous() {
             local vir_w2g_out="${SCENARIO_TMP_DIR}/iperf_vir_w2g_${i}.json"
             local vir_w6g_out="${SCENARIO_TMP_DIR}/iperf_vir_w6g_${i}.json"
 
-            log_cmd "iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} --bind-dev ${DETECTED_WIFI_IF} -p ${SIM_PORT_WIFI1} -t ${duration} -J > ${hw_wifi_out} &"
-            iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" --bind-dev "${DETECTED_WIFI_IF}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J > "${hw_wifi_out}" 2>&1 &
-            local hp1=$!
-            ACTIVE_BG_PIDS+=("${hp1}")
+            traffic_run_bg --job "hp1" --out "${hw_wifi_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" --bind-dev "${DETECTED_WIFI_IF}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J
+            traffic_run_bg --job "hp2" --netns "${WLAN2G_NS:-ns-wlan2g}" --out "${vir_w2g_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI2}" -t "${duration}" -J
+            traffic_run_bg --job "hp3" --netns "${WLAN6G_NS:-ns-wlan6g}" --out "${vir_w6g_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI3}" -t "${duration}" -J
 
-            log_cmd "ip netns exec ${WLAN2G_NS:-ns-wlan2g} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIFI2} -t ${duration} -J > ${vir_w2g_out} &"
-            ip netns exec "${WLAN2G_NS:-ns-wlan2g}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI2}" -t "${duration}" -J > "${vir_w2g_out}" 2>&1 &
-            local hp2=$!
-            ACTIVE_BG_PIDS+=("${hp2}")
-
-            log_cmd "ip netns exec ${WLAN6G_NS:-ns-wlan6g} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIFI3} -t ${duration} -J > ${vir_w6g_out} &"
-            ip netns exec "${WLAN6G_NS:-ns-wlan6g}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI3}" -t "${duration}" -J > "${vir_w6g_out}" 2>&1 &
-            local hp3=$!
-            ACTIVE_BG_PIDS+=("${hp3}")
-
-            wait "${hp1}" "${hp2}" "${hp3}" 2>/dev/null || true
-            _sim_terminate_pids "${hp1}" "${hp2}" "${hp3}"
+            traffic_wait_all "hp1" "hp2" "hp3"
             sleep 0.2
 
             local a_val
@@ -777,28 +724,16 @@ run_phase_simultaneous() {
             local sim_vir_w2g_out="${SCENARIO_TMP_DIR}/iperf_sim_vir_w2g_${i}.json"
             local sim_vir_w6g_out="${SCENARIO_TMP_DIR}/iperf_sim_vir_w6g_${i}.json"
 
-            log_cmd "ip netns exec ${PC_NS:-ns-pc} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIRED} -t ${duration} -J > ${sim_pc_out} &"
-            ip netns exec "${PC_NS:-ns-pc}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIRED}" -t "${duration}" -J > "${sim_pc_out}" 2>&1 &
-            local hsp0=$!
-            ACTIVE_BG_PIDS+=("${hsp0}")
+            traffic_run_bg --job "hsp0" --netns "${PC_NS:-ns-pc}" --out "${sim_pc_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIRED}" -t "${duration}" -J
+            traffic_run_bg --job "hsp1" --out "${sim_hw_wifi_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" --bind-dev "${DETECTED_WIFI_IF}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J
+            traffic_run_bg --job "hsp2" --netns "${WLAN2G_NS:-ns-wlan2g}" --out "${sim_vir_w2g_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI2}" -t "${duration}" -J
+            traffic_run_bg --job "hsp3" --netns "${WLAN6G_NS:-ns-wlan6g}" --out "${sim_vir_w6g_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI3}" -t "${duration}" -J
 
-            log_cmd "iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} --bind-dev ${DETECTED_WIFI_IF} -p ${SIM_PORT_WIFI1} -t ${duration} -J > ${sim_hw_wifi_out} &"
-            iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" --bind-dev "${DETECTED_WIFI_IF}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J > "${sim_hw_wifi_out}" 2>&1 &
-            local hsp1=$!
-            ACTIVE_BG_PIDS+=("${hsp1}")
-
-            log_cmd "ip netns exec ${WLAN2G_NS:-ns-wlan2g} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIFI2} -t ${duration} -J > ${sim_vir_w2g_out} &"
-            ip netns exec "${WLAN2G_NS:-ns-wlan2g}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI2}" -t "${duration}" -J > "${sim_vir_w2g_out}" 2>&1 &
-            local hsp2=$!
-            ACTIVE_BG_PIDS+=("${hsp2}")
-
-            log_cmd "ip netns exec ${WLAN6G_NS:-ns-wlan6g} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIFI3} -t ${duration} -J > ${sim_vir_w6g_out} &"
-            ip netns exec "${WLAN6G_NS:-ns-wlan6g}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI3}" -t "${duration}" -J > "${sim_vir_w6g_out}" 2>&1 &
-            local hsp3=$!
-            ACTIVE_BG_PIDS+=("${hsp3}")
-
-            wait "${hsp0}" "${hsp1}" "${hsp2}" "${hsp3}" 2>/dev/null || true
-            _sim_terminate_pids "${hsp0}" "${hsp1}" "${hsp2}" "${hsp3}"
+            traffic_wait_all "hsp0" "hsp1" "hsp2" "hsp3"
             sleep 0.2
 
             local c_wired c_wifi c_val
@@ -817,23 +752,14 @@ run_phase_simultaneous() {
             local w5g_out="${SCENARIO_TMP_DIR}/iperf_w5g_${i}.json"
             local w6g_out="${SCENARIO_TMP_DIR}/iperf_w6g_${i}.json"
 
-            log_cmd "ip netns exec ${WLAN2G_NS:-ns-wlan2g} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIRED} -t ${duration} -J > ${w2g_out} &"
-            ip netns exec "${WLAN2G_NS:-ns-wlan2g}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIRED}" -t "${duration}" -J > "${w2g_out}" 2>&1 &
-            local p1=$!
-            ACTIVE_BG_PIDS+=("${p1}")
+            traffic_run_bg --job "p1" --netns "${WLAN2G_NS:-ns-wlan2g}" --out "${w2g_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIRED}" -t "${duration}" -J
+            traffic_run_bg --job "p2" --netns "${WLAN5G_NS:-ns-wlan5g}" --out "${w5g_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J
+            traffic_run_bg --job "p3" --netns "${WLAN6G_NS:-ns-wlan6g}" --out "${w6g_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI2}" -t "${duration}" -J
 
-            log_cmd "ip netns exec ${WLAN5G_NS:-ns-wlan5g} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIFI1} -t ${duration} -J > ${w5g_out} &"
-            ip netns exec "${WLAN5G_NS:-ns-wlan5g}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J > "${w5g_out}" 2>&1 &
-            local p2=$!
-            ACTIVE_BG_PIDS+=("${p2}")
-
-            log_cmd "ip netns exec ${WLAN6G_NS:-ns-wlan6g} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIFI2} -t ${duration} -J > ${w6g_out} &"
-            ip netns exec "${WLAN6G_NS:-ns-wlan6g}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI2}" -t "${duration}" -J > "${w6g_out}" 2>&1 &
-            local p3=$!
-            ACTIVE_BG_PIDS+=("${p3}")
-
-            wait "${p1}" "${p2}" "${p3}" 2>/dev/null || true
-            _sim_terminate_pids "${p1}" "${p2}" "${p3}"
+            traffic_wait_all "p1" "p2" "p3"
             sleep 0.2
 
             local a_val
@@ -857,28 +783,16 @@ run_phase_simultaneous() {
             local sim_w5g_out="${SCENARIO_TMP_DIR}/iperf_sim_w5g_${i}.json"
             local sim_w6g_out="${SCENARIO_TMP_DIR}/iperf_sim_w6g_${i}.json"
 
-            log_cmd "ip netns exec ${PC_NS:-ns-pc} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIRED} -t ${duration} -J > ${sim_pc_out} &"
-            ip netns exec "${PC_NS:-ns-pc}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIRED}" -t "${duration}" -J > "${sim_pc_out}" 2>&1 &
-            local sp0=$!
-            ACTIVE_BG_PIDS+=("${sp0}")
+            traffic_run_bg --job "sp0" --netns "${PC_NS:-ns-pc}" --out "${sim_pc_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIRED}" -t "${duration}" -J
+            traffic_run_bg --job "sp1" --netns "${WLAN2G_NS:-ns-wlan2g}" --out "${sim_w2g_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J
+            traffic_run_bg --job "sp2" --netns "${WLAN5G_NS:-ns-wlan5g}" --out "${sim_w5g_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI2}" -t "${duration}" -J
+            traffic_run_bg --job "sp3" --netns "${WLAN6G_NS:-ns-wlan6g}" --out "${sim_w6g_out}" \
+                iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI3}" -t "${duration}" -J
 
-            log_cmd "ip netns exec ${WLAN2G_NS:-ns-wlan2g} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIFI1} -t ${duration} -J > ${sim_w2g_out} &"
-            ip netns exec "${WLAN2G_NS:-ns-wlan2g}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI1}" -t "${duration}" -J > "${sim_w2g_out}" 2>&1 &
-            local sp1=$!
-            ACTIVE_BG_PIDS+=("${sp1}")
-
-            log_cmd "ip netns exec ${WLAN5G_NS:-ns-wlan5g} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIFI2} -t ${duration} -J > ${sim_w5g_out} &"
-            ip netns exec "${WLAN5G_NS:-ns-wlan5g}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI2}" -t "${duration}" -J > "${sim_w5g_out}" 2>&1 &
-            local sp2=$!
-            ACTIVE_BG_PIDS+=("${sp2}")
-
-            log_cmd "ip netns exec ${WLAN6G_NS:-ns-wlan6g} iperf3 -c ${WAN_SERVER_IP:-10.10.0.1} -p ${SIM_PORT_WIFI3} -t ${duration} -J > ${sim_w6g_out} &"
-            ip netns exec "${WLAN6G_NS:-ns-wlan6g}" iperf3 -c "${WAN_SERVER_IP:-10.10.0.1}" -p "${SIM_PORT_WIFI3}" -t "${duration}" -J > "${sim_w6g_out}" 2>&1 &
-            local sp3=$!
-            ACTIVE_BG_PIDS+=("${sp3}")
-
-            wait "${sp0}" "${sp1}" "${sp2}" "${sp3}" 2>/dev/null || true
-            _sim_terminate_pids "${sp0}" "${sp1}" "${sp2}" "${sp3}"
+            traffic_wait_all "sp0" "sp1" "sp2" "sp3"
             sleep 0.2
 
             local c_wired c_wifi c_val
@@ -893,6 +807,7 @@ run_phase_simultaneous() {
     done
 
     _sim_stop_servers
+    _sim_cleanup_wifi_route
 
     local a_str b_str c_str c_wired_str c_wifi_str
     a_str="$(IFS=,; echo "${a_trials[*]}")"
@@ -914,5 +829,5 @@ run_phase_simultaneous() {
     )
 
     log_cmd "${eval_cmd[*]}"
-    "${eval_cmd[@]}"
+    "${eval_cmd[@]}" || true
 }

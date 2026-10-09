@@ -469,12 +469,8 @@ main() {
     export CUSTOM_CLIENT_MODE="${CUSTOM_CLIENT_MODE:-}"
     export CUSTOM_REMOTE_DEV="${CUSTOM_REMOTE_DEV:-}"
 
-    local tools_dir="${LAB_DIR}/tools"
-    if [[ -x "${tools_dir}/wifi_inspector.py" ]]; then
-        local env_dump
-        env_dump="$("${tools_dir}/wifi_inspector.py" export-env 2>/dev/null || true)"
-        eval "${env_dump}"
-    fi
+    # Resolve global running context and invariant Execution Plan
+    orchestrator_resolve_context
 
     if (( DRY_RUN == 0 )); then
         require_root
