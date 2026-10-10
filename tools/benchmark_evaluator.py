@@ -248,6 +248,67 @@ class BenchmarkEvaluator:
         return EvaluationResult("unicast_throughput", status, res_data, table_str)
 
     # --------------------------------------------------------------------------
+    # 1b. Single-Stream / Scenario Template Benchmark
+    # --------------------------------------------------------------------------
+    @classmethod
+    def evaluate_stream(
+        cls,
+        input_file: Union[str, Path],
+        output_file: Optional[Union[str, Path]] = None,
+        proto: str = "udp",
+        duration: float = 10.0,
+        target_bitrate: str = "500M",
+        max_loss_pct: float = 0.5,
+        test_name: str = "template_throughput",
+        scenario: str = "template",
+        as_json: bool = False
+    ) -> EvaluationResult:
+        """Parse raw stream output (iperf3) into canonical evaluated schema."""
+        inp_p = Path(input_file)
+        data: Dict[str, Any] = {}
+        if inp_p.is_file():
+            try:
+                with open(inp_p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+
+        end_sum = data.get("end", {}).get("sum", {}) or data.get("end", {}).get("sum_received", {})
+        bps = end_sum.get("bits_per_second", 0.0)
+        mbps = round(bps / 1e6, 2)
+        loss_pct = round(end_sum.get("lost_percent", 0.0), 3)
+        lost_pkts = end_sum.get("lost_packets", 0)
+        total_pkts = end_sum.get("packets", 0)
+        jitter_ms = round(end_sum.get("jitter_ms", 0.0), 3)
+
+        verdict = BenchmarkVerdict.PASS
+        if proto.lower() == "udp" and loss_pct > max_loss_pct:
+            verdict = BenchmarkVerdict.FAIL
+
+        summary = {
+            "test": test_name,
+            "scenario": scenario,
+            "protocol": proto.lower(),
+            "duration_sec": duration,
+            "target_bitrate": target_bitrate,
+            "throughput_mbps": mbps,
+            "packet_loss_pct": loss_pct,
+            "lost_packets": lost_pkts,
+            "total_packets": total_pkts,
+            "jitter_ms": jitter_ms,
+            "verdict": verdict,
+        }
+
+        if output_file:
+            out_p = Path(output_file)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_p, "w", encoding="utf-8") as out_f:
+                json.dump(summary, out_f, indent=2)
+
+        rendered = f"Throughput: {mbps} Mbps | Loss: {loss_pct}% | Verdict: [{verdict}]"
+        return EvaluationResult(test_name, verdict, summary, rendered, 0 if verdict == BenchmarkVerdict.PASS else 1)
+
+    # --------------------------------------------------------------------------
     # 2. Simultaneous Wired & Wireless Download Benchmark (TC-SIM-01)
     # --------------------------------------------------------------------------
     @classmethod
@@ -932,11 +993,40 @@ def main() -> int:
     p_qm.add_argument("fields", nargs="+", help="Fields to extract.")
     p_qm.add_argument("--default", "-d", default="MISSING", help="Default fallback value.")
 
+    # eval-stream
+    p_es = subparsers.add_parser("eval-stream", help="Parse and evaluate single stream test results (iperf3, UDP, TCP).")
+    p_es.add_argument("--input", "-i", required=True, help="Path to raw stream client JSON.")
+    p_es.add_argument("--output", "-o", help="Optional path to output evaluation JSON.")
+    p_es.add_argument("--proto", default="udp", help="Transport protocol (udp/tcp).")
+    p_es.add_argument("--duration", type=float, default=10.0, help="Test duration in seconds.")
+    p_es.add_argument("--target-bitrate", default="500M", help="Target stream bitrate.")
+    p_es.add_argument("--max-loss-pct", type=float, default=0.5, help="Max loss percent threshold.")
+    p_es.add_argument("--test-name", default="template_throughput", help="Canonical test name.")
+    p_es.add_argument("--scenario", default="template", help="Scenario identifier.")
+    p_es.add_argument("--json", action="store_true", help="Output raw JSON.")
+
     args = parser.parse_args()
     if args.subcommand == "query-metrics":
         res = BenchmarkEvaluator.query_metrics(args.file, args.fields, args.default)
         print(" ".join(str(res[f]) for f in args.fields))
         return 0
+    elif args.subcommand == "eval-stream":
+        res = BenchmarkEvaluator.evaluate_stream(
+            input_file=args.input,
+            output_file=getattr(args, "output", None),
+            proto=getattr(args, "proto", "udp"),
+            duration=float(getattr(args, "duration", 10.0)),
+            target_bitrate=getattr(args, "target_bitrate", "500M"),
+            max_loss_pct=float(getattr(args, "max_loss_pct", 0.5)),
+            test_name=getattr(args, "test_name", "template_throughput"),
+            scenario=getattr(args, "scenario", "template"),
+            as_json=getattr(args, "json", False)
+        )
+        if getattr(args, "json", False):
+            print(res.to_json())
+        else:
+            print(res.rendered_table)
+        return res.exit_code
     return 0
 
 

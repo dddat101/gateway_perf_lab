@@ -73,10 +73,10 @@ main() {
         printf '    sudo apt-get update && sudo apt-get install -y %s\n' "${missing_tools[*]}"
     fi
 
-    # 1.1 Python Measurement Engines
-    print_section "LAB MEASUREMENT ENGINES"
+    # 1.1 Python Measurement & Framework Engines
+    print_section "LAB MEASUREMENT & EVALUATION ENGINES"
     local py_tool
-    for py_tool in traffic_generator.py geforce_now_tester.py vod_stream_tester.py voip_call_simulator.py mcast_forwarder.py wifi_inspector.py; do
+    for py_tool in traffic_generator.py metric_parser.py benchmark_evaluator.py evidence_auditor.py running_context.py geforce_now_tester.py vod_stream_tester.py voip_call_simulator.py mcast_forwarder.py wifi_inspector.py; do
         local tool_path="${LAB_DIR}/tools/${py_tool}"
         if [[ -f "${tool_path}" && -x "${tool_path}" ]]; then
             check_item "Tool: ${py_tool}" "PASS" "Executable (${tool_path})"

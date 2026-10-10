@@ -9,6 +9,7 @@ IFS=$'\n\t'
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly LAB_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+readonly DUT_PAYLOAD_DIR="${SCRIPT_DIR}/dut"
 # shellcheck source=lib/common.sh
 source "${SCRIPT_DIR}/lib/common.sh"
 
@@ -194,21 +195,36 @@ dut_ssh_raw() {
 
     # Wrap script to break out of embedded router shells (e.g. vendor management CLI menus; "sh" drops to a POSIX shell),
     # set standard binary PATH, define has_cmd, and isolate payload output between delimiter markers.
-    local wrapped_payload
-    wrapped_payload="$(cat <<EOF
-sh
-export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/home/bin:/home/scripts:/opt/scripts:\$PATH
-has_cmd() { which "\$1" >/dev/null 2>&1 || type "\$1" >/dev/null 2>&1 || command -v "\$1" >/dev/null 2>&1; }
-echo "${start_marker}"
-${raw_script}
-echo "${end_marker}"
-exit
-exit
-EOF
-)"
-
-    printf '%s\n' "${wrapped_payload}" | "${ssh_base[@]}" 2>/dev/null | \
+    {
+        printf 'sh\n'
+        printf 'export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/home/bin:/home/scripts:/opt/scripts:$PATH\n'
+        printf 'has_cmd() { which "$1" >/dev/null 2>&1 || type "$1" >/dev/null 2>&1 || command -v "$1" >/dev/null 2>&1; }\n'
+        printf 'echo "%s"\n' "${start_marker}"
+        printf '%s\n' "${raw_script}"
+        printf 'echo "%s"\n' "${end_marker}"
+        printf 'exit\nexit\n'
+    } | "${ssh_base[@]}" 2>/dev/null | \
         sed -n "/${start_marker}/,/${end_marker}/{ /${start_marker}/d; /${end_marker}/d; p; }"
+}
+
+dut_ssh_script() {
+    local script_file="$1"; shift
+    [[ -f "${script_file}" ]] || die "DUT script payload not found: ${script_file}"
+
+    local script_content
+    script_content="$(<"${script_file}")"
+
+    # If arguments are passed, prepend positional parameter assignment
+    if [[ $# -gt 0 ]]; then
+        local args_quoted=()
+        for arg in "$@"; do
+            args_quoted+=("$(printf '%q' "${arg}")")
+        done
+        script_content="set -- ${args_quoted[*]}
+${script_content}"
+    fi
+
+    dut_ssh_raw "${script_content}"
 }
 
 dut_ssh_exec() {
@@ -235,34 +251,8 @@ cmd_test() {
 
     # 2. SSH Connection check
     log_info "Testing SSH authentication..."
-    local probe_script='
-        echo "AUTH:OK"
-        echo "UNAME:$(uname -srm 2>/dev/null || echo "unknown")"
-        echo "HOSTNAME:$(hostname 2>/dev/null || echo "unknown")"
-        echo "UPTIME:$(uptime 2>/dev/null || echo "unknown")"
-
-        # Check OS release
-        os_name="Generic Linux"
-        if [ -f /etc/openwrt_release ]; then
-            os_name="OpenWrt"
-        elif [ -f /etc/os-release ]; then
-            os_name="$(grep "^PRETTY_NAME=" /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d "\"")"
-        fi
-        echo "OS_NAME:${os_name}"
-
-        # Probe networking & QoS tools
-        for tool in ip tc ethtool brctl bridge iptables nft uci wl iw hostapd_cli; do
-            if has_cmd "$tool"; then
-                tool_path="$(which "$tool" 2>/dev/null || echo "$tool")"
-                echo "TOOL:${tool}:AVAILABLE:${tool_path}"
-            else
-                echo "TOOL:${tool}:MISSING"
-            fi
-        done
-    '
-
     local probe_output=""
-    if ! probe_output="$(dut_ssh_raw "${probe_script}" 2>/dev/null)"; then
+    if ! probe_output="$(dut_ssh_script "${DUT_PAYLOAD_DIR}/probe.sh" 2>/dev/null)"; then
         log_error "SSH authentication to DUT failed!"
         log_error "Please verify DUT IP (${TARGET_HOST}), credentials, or SSH key configuration."
         if [[ -z "${TARGET_KEY}" && -z "${TARGET_PASS}" ]]; then
@@ -302,38 +292,7 @@ cmd_status() {
     print_header "DUT RUNTIME STATUS OVERVIEW"
     log_info "Target Endpoint: ${TARGET_USER}@${TARGET_HOST}"
 
-    local status_script='
-        echo "=== [SYSTEM & UPTIME] ==="
-        uptime 2>/dev/null || true
-        free -m 2>/dev/null || free 2>/dev/null || true
-        echo ""
-        echo "=== [NETWORK INTERFACES] ==="
-        ip -d link show 2>/dev/null | grep -E "^[0-9]+: " | awk "{print \$2}" | tr -d ":" || true
-        echo ""
-        echo "=== [WIRELESS SUBSYSTEM] ==="
-        if has_cmd wl; then
-            echo "Wireless Driver: wl CLI detected"
-            for wlif in wl1 wl0 wl2; do
-                if wl -i "$wlif" status >/dev/null 2>&1; then
-                    echo "--- Interface: $wlif ---"
-                    wl -i "$wlif" status 2>/dev/null | grep -E "SSID:|Channel:|Mode:|BSSID:|QBSS" || true
-                fi
-            done
-        elif has_cmd iw; then
-            echo "Wireless Driver: nl80211 (iw) detected"
-            iw dev 2>/dev/null || true
-        else
-            echo "No standard wireless CLI (wl / iw) detected."
-        fi
-        echo ""
-        echo "=== [QOS & TC QDISC] ==="
-        if has_cmd tc; then
-            tc -s qdisc show 2>/dev/null || true
-        else
-            echo "tc tool not found on DUT."
-        fi
-    '
-    dut_ssh_raw "${status_script}"
+    dut_ssh_script "${DUT_PAYLOAD_DIR}/status.sh"
 }
 
 cmd_exec() {
@@ -394,63 +353,8 @@ cmd_wmm() {
     log_info "Target Endpoint: ${TARGET_USER}@${TARGET_HOST}"
     log_info "Radio Selector : iface=${specified_if:-auto} bssid=${want_bssid:-any} band=${band_token:-any}"
 
-    local wmm_extract_script
-    wmm_extract_script="$(cat <<'REMOTE_EOF'
-        sel_if="__SEL_IF__"
-        want_bssid="__WANT_BSSID__"
-        want_band="__WANT_BAND__"
-
-        if has_cmd wl; then
-            cands=""
-            for c in wl0 wl1 wl2 wl3; do
-                if wl -i "$c" status >/dev/null 2>&1; then cands="$cands $c"; fi
-            done
-
-            radio_bssid() {
-                wl -i "$1" status 2>/dev/null | sed -n "s/.*BSSID: \([0-9A-Fa-f:]*\).*/\1/p" | sed -n 1p | tr "A-F" "a-f"
-            }
-
-            # Selection priority: explicit iface > BSSID match > band match > first active radio
-            if [ -z "$sel_if" ] && [ -n "$want_bssid" ]; then
-                for c in $cands; do
-                    if [ "$(radio_bssid "$c")" = "$want_bssid" ]; then sel_if="$c"; echo "MATCH:bssid"; break; fi
-                done
-            fi
-            if [ -z "$sel_if" ] && [ -n "$want_band" ]; then
-                for c in $cands; do
-                    if wl -i "$c" status 2>/dev/null | grep -q "Chanspec: ${want_band}"; then sel_if="$c"; echo "MATCH:band"; break; fi
-                done
-            fi
-            if [ -z "$sel_if" ]; then
-                for c in $cands; do sel_if="$c"; echo "MATCH:first_active"; break; done
-            fi
-            [ -z "$sel_if" ] && { echo "DRIVER:NO_ACTIVE_RADIO"; exit 0; }
-
-            echo "DRIVER:WL_CLI"
-            echo "INTERFACE:${sel_if}"
-            echo "BSSID:$(radio_bssid "$sel_if")"
-            echo "CHANSPEC:$(wl -i "$sel_if" status 2>/dev/null | sed -n "s/^[[:space:]]*Chanspec: //p" | sed -n 1p)"
-            echo "--- AP_EDCA ---"
-            wl -i "${sel_if}" wme_ac ap 2>/dev/null || true
-            echo "--- STA_EDCA ---"
-            wl -i "${sel_if}" wme_ac sta 2>/dev/null || true
-            exit 0
-        fi
-
-        if has_cmd hostapd_cli; then
-            echo "DRIVER:HOSTAPD_UNSUPPORTED"
-            exit 0
-        fi
-
-        echo "DRIVER:UNKNOWN"
-REMOTE_EOF
-)"
-    wmm_extract_script="${wmm_extract_script//__SEL_IF__/${specified_if}}"
-    wmm_extract_script="${wmm_extract_script//__WANT_BSSID__/${want_bssid}}"
-    wmm_extract_script="${wmm_extract_script//__WANT_BAND__/${band_token}}"
-
     local wmm_out
-    wmm_out="$(dut_ssh_raw "${wmm_extract_script}" 2>/dev/null | tr -d '\r' || true)"
+    wmm_out="$(dut_ssh_script "${DUT_PAYLOAD_DIR}/wmm_edca.sh" "${specified_if}" "${want_bssid}" "${band_token}" 2>/dev/null | tr -d '\r' || true)"
 
     local detected_driver="" detected_if="" detected_bssid="" detected_chanspec="" match_rule=""
     local -A edca=()
@@ -514,41 +418,33 @@ REMOTE_EOF
     fi
 
     mkdir -p "$(dirname "${target_out}")" 2>/dev/null || true
-    cat <<EOF > "${target_out}"
-{
-  "source": "DUT wl CLI [${detected_if}]",
-  "dut_host": "${TARGET_HOST}",
-  "interface": "${detected_if}",
-  "bssid": "${detected_bssid}",
-  "chanspec": "${detected_chanspec}",
-  "selection_rule": "${match_rule:-explicit}",
-  "collected_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
-  "AC_VO": {
-    "aifsn": ${edca[AC_VO_aifsn]},
-    "cwmin": ${edca[AC_VO_cwmin]},
-    "cwmax": ${edca[AC_VO_cwmax]},
-    "txop_limit_us": ${edca[AC_VO_txop]}
-  },
-  "AC_VI": {
-    "aifsn": ${edca[AC_VI_aifsn]},
-    "cwmin": ${edca[AC_VI_cwmin]},
-    "cwmax": ${edca[AC_VI_cwmax]},
-    "txop_limit_us": ${edca[AC_VI_txop]}
-  },
-  "AC_BE": {
-    "aifsn": ${edca[AC_BE_aifsn]},
-    "cwmin": ${edca[AC_BE_cwmin]},
-    "cwmax": ${edca[AC_BE_cwmax]},
-    "txop_limit_us": ${edca[AC_BE_txop]}
-  },
-  "AC_BK": {
-    "aifsn": ${edca[AC_BK_aifsn]},
-    "cwmin": ${edca[AC_BK_cwmin]},
-    "cwmax": ${edca[AC_BK_cwmax]},
-    "txop_limit_us": ${edca[AC_BK_txop]}
-  }
-}
-EOF
+    local metric_tool="${LAB_DIR}/tools/metric_parser.py"
+    if [[ -f "${metric_tool}" ]]; then
+        "${PYTHON_BIN:-python3}" "${metric_tool}" write-ap-edca \
+            --output "${target_out}" \
+            --source "DUT wl CLI [${detected_if}]" \
+            --dut-host "${TARGET_HOST}" \
+            --interface "${detected_if}" \
+            --bssid "${detected_bssid}" \
+            --chanspec "${detected_chanspec}" \
+            --selection-rule "${match_rule:-explicit}" \
+            --vo-aifsn "${edca[AC_VO_aifsn]}" \
+            --vo-cwmin "${edca[AC_VO_cwmin]}" \
+            --vo-cwmax "${edca[AC_VO_cwmax]}" \
+            --vo-txop "${edca[AC_VO_txop]}" \
+            --vi-aifsn "${edca[AC_VI_aifsn]}" \
+            --vi-cwmin "${edca[AC_VI_cwmin]}" \
+            --vi-cwmax "${edca[AC_VI_cwmax]}" \
+            --vi-txop "${edca[AC_VI_txop]}" \
+            --be-aifsn "${edca[AC_BE_aifsn]}" \
+            --be-cwmin "${edca[AC_BE_cwmin]}" \
+            --be-cwmax "${edca[AC_BE_cwmax]}" \
+            --be-txop "${edca[AC_BE_txop]}" \
+            --bk-aifsn "${edca[AC_BK_aifsn]}" \
+            --bk-cwmin "${edca[AC_BK_cwmin]}" \
+            --bk-cwmax "${edca[AC_BK_cwmax]}" \
+            --bk-txop "${edca[AC_BK_txop]}" 2>/dev/null || true
+    fi
 
     chmod 0666 "${target_out}" 2>/dev/null || true
     log_pass "AP-side WMM EDCA parameters saved to: ${target_out}"
@@ -581,25 +477,15 @@ cmd_stats() {
 
     mkdir -p "${STATE_DIR}" 2>/dev/null || true
 
-    local stats_script='
-        # Snapshot /proc/net/dev counters
-        awk '\''NR > 2 {
-            iface=$1; sub(":", "", iface);
-            rx_b=$2; rx_p=$3; rx_err=$4; rx_drp=$5;
-            tx_b=$10; tx_p=$11; tx_err=$12; tx_drp=$13;
-            print iface, rx_p, rx_b, rx_drp, rx_err, tx_p, tx_b, tx_drp, tx_err;
-        }'\'' /proc/net/dev 2>/dev/null || true
-    '
-
     case "${action}" in
         start|baseline)
             print_header "RECORDING DUT INTERFACE COUNTERS (BASELINE)"
-            dut_ssh_raw "${stats_script}" > "${state_start}"
+            dut_ssh_script "${DUT_PAYLOAD_DIR}/dev_stats.sh" > "${state_start}"
             log_pass "DUT baseline counters recorded to: ${state_start}"
             ;;
         stop|snapshot)
             print_header "RECORDING DUT INTERFACE COUNTERS (AFTER TEST)"
-            dut_ssh_raw "${stats_script}" > "${state_stop}"
+            dut_ssh_script "${DUT_PAYLOAD_DIR}/dev_stats.sh" > "${state_stop}"
             log_pass "DUT post-test counters recorded to: ${state_stop}"
             ;;
         diff|delta)
@@ -608,7 +494,7 @@ cmd_stats() {
                 if [[ ! -f "${state_start}" ]]; then
                     die "No baseline found. Run './scripts/dut_collector.sh stats start' before running traffic."
                 fi
-                dut_ssh_raw "${stats_script}" > "${state_stop}"
+                dut_ssh_script "${DUT_PAYLOAD_DIR}/dev_stats.sh" > "${state_stop}"
             fi
 
             print_header "DUT INTERFACE TRAFFIC & DROP COUNTER DELTAS"
@@ -702,103 +588,8 @@ cmd_collect() {
     log_info "Output Bundle   : ${out_dir}"
     log_info "Scope Categories: ${CLI_CATEGORY}"
 
-    local col_script='
-        rm -rf /tmp/dut_artifacts && mkdir -p /tmp/dut_artifacts
-
-        run_save() {
-            fname="/tmp/dut_artifacts/$1"
-            shift
-            echo "=== [COMMAND: $*] ===" > "$fname"
-            "$@" >> "$fname" 2>&1 || true
-        }
-
-        # 1. System Overview
-        run_save dut_01_system.txt uname -a
-        run_save dut_02_uptime.txt uptime
-        run_save dut_03_memory.txt free -m
-        run_save dut_04_cpuinfo.txt cat /proc/cpuinfo
-        run_save dut_05_version.txt cat /proc/version
-
-        # 2. Network & Interfaces
-        run_save dut_06_ip_links.txt ip -d link show
-        run_save dut_07_ip_addrs.txt ip addr show
-        run_save dut_08_ip_routes.txt ip route show
-        run_save dut_09_ip_routes6.txt ip -6 route show
-        run_save dut_10_ip_neigh.txt ip neigh show
-        run_save dut_11_arp_table.txt cat /proc/net/arp
-        run_save dut_12_bridge_fdb.txt bridge fdb show
-        run_save dut_13_bridge_link.txt bridge link show
-
-        # 3. Drops & Statistics
-        run_save dut_14_link_stats.txt ip -s link show
-        run_save dut_15_proc_net_dev.txt cat /proc/net/dev
-
-        # Ethtool hardware drop/pause inspection
-        if has_cmd ethtool; then
-            for iface in eth0 eth1 eth2 eth3 eth4 br0 wl0 wl1 wl2; do
-                run_save "dut_16_ethtool_${iface}.txt" ethtool -S "$iface"
-                run_save "dut_17_ethtool_drv_${iface}.txt" ethtool -i "$iface"
-            done
-        fi
-
-        # 4. QoS & Traffic Control
-        if has_cmd tc; then
-            run_save dut_18_tc_qdisc.txt tc -s qdisc show
-            run_save dut_19_tc_class.txt tc -s class show
-            run_save dut_20_tc_filter.txt tc -s filter show
-        fi
-        if has_cmd iptables-save; then
-            run_save dut_21_iptables_save.txt iptables-save
-        fi
-        if has_cmd iptables; then
-            run_save dut_22_iptables_mangle.txt iptables -t mangle -nvL
-            run_save dut_23_iptables_nat.txt iptables -t nat -nvL
-        fi
-        if has_cmd nft; then
-            run_save dut_23_nft_ruleset.txt nft list ruleset
-        fi
-
-        # 5. Conntrack & Buffers
-        if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
-            run_save dut_24_conntrack_count.txt cat /proc/sys/net/netfilter/nf_conntrack_count
-            run_save dut_25_conntrack_max.txt cat /proc/sys/net/netfilter/nf_conntrack_max
-        fi
-        run_save dut_26_sysctl_net.txt sysctl net
-
-        # 6. Wireless Subsystem
-        if has_cmd wl; then
-            for wlif in wl0 wl1 wl2; do
-                if wl -i "$wlif" status >/dev/null 2>&1; then
-                    run_save "dut_27_${wlif}_status.txt" wl -i "$wlif" status
-                    run_save "dut_28_${wlif}_assoclist.txt" wl -i "$wlif" assoclist
-                    run_save "dut_29_${wlif}_counters.txt" wl -i "$wlif" counters
-                    run_save "dut_30_${wlif}_wme_ap.txt" wl -i "$wlif" wme_ac ap
-                    run_save "dut_31_${wlif}_wme_sta.txt" wl -i "$wlif" wme_ac sta
-                fi
-            done
-        elif has_cmd iw; then
-            run_save dut_27_iw_dev.txt iw dev
-            run_save dut_28_iw_phy.txt iw phy
-        fi
-
-        # 7. Logs
-        run_save dut_32_dmesg.log dmesg
-        if has_cmd logread; then
-            run_save dut_33_logread.log logread
-        elif [ -f /var/log/messages ]; then
-            run_save dut_33_messages.log cat /var/log/messages
-        elif [ -f /tmp/log/messages ]; then
-            run_save dut_33_messages.log cat /tmp/log/messages
-        fi
-
-        # Package artifacts into compressed tarball and stream via xxd
-        tar -czf /tmp/dut_artifacts.tar.gz -C /tmp/dut_artifacts .
-        xxd -p /tmp/dut_artifacts.tar.gz
-        rm -rf /tmp/dut_artifacts /tmp/dut_artifacts.tar.gz
-    '
-
     log_info "Executing remote collection suite and streaming artifacts from DUT..."
-    dut_ssh_raw "${col_script}" | xxd -r -p | tar -xzf - -C "${out_dir}" 2>/dev/null || true
+    dut_ssh_script "${DUT_PAYLOAD_DIR}/collect_diagnostics.sh" | xxd -r -p | tar -xzf - -C "${out_dir}" 2>/dev/null || true
 
     # Extract AP-side WMM parameters to ap_edca.json inside the bundle
     cmd_wmm --out "${out_dir}/ap_edca.json" "${wmm_if_args[@]}" >/dev/null 2>&1 || true
@@ -810,16 +601,16 @@ cmd_collect() {
     total_bytes="$(du -sh "${out_dir}" 2>/dev/null | cut -f1 || echo "0B")"
 
     # Generate Manifest JSON
-    cat <<EOF > "${out_dir}/manifest.json"
-{
-  "artifact_bundle": "dut_diagnostics",
-  "collected_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
-  "dut_host": "${TARGET_HOST}",
-  "dut_user": "${TARGET_USER}",
-  "total_files": ${file_count},
-  "total_size": "${total_bytes}"
-}
-EOF
+    local metric_tool="${LAB_DIR}/tools/metric_parser.py"
+    if [[ -f "${metric_tool}" ]]; then
+        "${PYTHON_BIN:-python3}" "${metric_tool}" write-bundle-manifest \
+            --output "${out_dir}/manifest.json" \
+            --bundle-name "dut_diagnostics" \
+            --dut-host "${TARGET_HOST}" \
+            --dut-user "${TARGET_USER}" \
+            --total-files "${file_count}" \
+            --total-size "${total_bytes}" 2>/dev/null || true
+    fi
 
     # Generate Summary Markdown
     {

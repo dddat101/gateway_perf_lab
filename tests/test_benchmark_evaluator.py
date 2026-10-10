@@ -328,6 +328,102 @@ class MetricParserAdapterCLITests(unittest.TestCase):
             )
             self.assertEqual(res.stdout.strip(), "PASS 950.0")
 
+    def test_cli_write_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_manifest = Path(td) / "test_capture_set.json"
+            res = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools/metric_parser.py"),
+                    "write-manifest",
+                    "--output", str(out_manifest),
+                    "--tag", "iperf_test",
+                    "--timestamp", "20261010_120000",
+                    "--bpf-filter", "udp port 5201",
+                    "--display-filter", "udp.port == 5201",
+                    "--snaplen", "128",
+                    "--wan-pcap", "/tmp/wan.pcap",
+                    "--wan-frames", "500",
+                    "--lan-pcap", "/tmp/lan.pcap",
+                    "--lan-frames", "498",
+                ],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            self.assertTrue(out_manifest.exists())
+            data = json.loads(out_manifest.read_text())
+            self.assertEqual(data["tag"], "iperf_test")
+            self.assertEqual(data["snaplen"], 128)
+            self.assertEqual(data["vantages"]["wan"]["frame_count"], 500)
+            self.assertEqual(data["vantages"]["lan"]["frame_count"], 498)
+            self.assertEqual(data["display_filter"], "udp.port == 5201")
+
+    def test_cli_write_bundle_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_manifest = Path(td) / "manifest.json"
+            res = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools/metric_parser.py"),
+                    "write-bundle-manifest",
+                    "--output", str(out_manifest),
+                    "--bundle-name", "run_20261010",
+                    "--dut-lan-ip", "192.168.1.1",
+                    "--total-files", "15",
+                    "--total-bytes", "1048576",
+                    "--counts", "metrics_json=3", "logs=5", "captures_pcap=2",
+                ],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            self.assertTrue(out_manifest.exists())
+            data = json.loads(out_manifest.read_text())
+            self.assertEqual(data["artifact_bundle"], "run_20261010")
+            self.assertEqual(data["total_files"], 15)
+            self.assertEqual(data["total_bytes"], 1048576)
+            self.assertEqual(data["counts"]["metrics_json"], 3)
+            self.assertEqual(data["counts"]["logs"], 5)
+
+    def test_cli_write_ap_edca(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_edca = Path(td) / "ap_edca.json"
+            res = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools/metric_parser.py"),
+                    "write-ap-edca",
+                    "--output", str(out_edca),
+                    "--interface", "wl0",
+                    "--bssid", "00:11:22:33:44:55",
+                    "--vo-aifsn", "2",
+                    "--vo-cwmin", "3",
+                    "--vo-cwmax", "7",
+                    "--vo-txop", "1504",
+                    "--vi-aifsn", "2",
+                    "--vi-cwmin", "7",
+                    "--vi-cwmax", "15",
+                    "--vi-txop", "3008",
+                    "--be-aifsn", "3",
+                    "--be-cwmin", "15",
+                    "--be-cwmax", "1023",
+                    "--be-txop", "0",
+                    "--bk-aifsn", "7",
+                    "--bk-cwmin", "15",
+                    "--bk-cwmax", "1023",
+                    "--bk-txop", "0",
+                ],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            self.assertTrue(out_edca.exists())
+            data = json.loads(out_edca.read_text())
+            self.assertEqual(data["interface"], "wl0")
+            self.assertEqual(data["AC_VO"]["txop_limit_us"], 1504)
+            self.assertEqual(data["AC_BE"]["cwmax"], 1023)
+
 
 if __name__ == "__main__":
     unittest.main()

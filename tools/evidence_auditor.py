@@ -9,6 +9,8 @@ wire-rate/multicast loss verification behind a single deep interface.
 
 import argparse
 import collections
+import concurrent.futures
+import functools
 import json
 import math
 import os
@@ -92,6 +94,35 @@ def parse_ports(port_str: Union[str, Tuple[int, ...], List[int]]) -> Tuple[int, 
     return tuple(int(p.strip()) for p in port_str.split(",") if p.strip())
 
 
+_RE_BPF_PORT = re.compile(r"\b(udp|tcp)\s+port\s+(\d+)\b")
+_RE_BPF_GENERIC_PORT = re.compile(r"\bport\s+(\d+)\b")
+_RE_BPF_HOST = re.compile(r"\bhost\s+([0-9.]+)\b")
+_RE_BPF_SRC = re.compile(r"\bsrc\s+([0-9.]+)\b")
+_RE_BPF_DST = re.compile(r"\bdst\s+([0-9.]+)\b")
+_RE_BPF_OR = re.compile(r"\bor\b")
+_RE_BPF_AND = re.compile(r"\band\b")
+
+
+@functools.lru_cache(maxsize=128)
+def bpf_to_display_filter(flt: str) -> str:
+    """Convert a BPF capture filter (e.g. 'udp port 5201 or tcp port 5201') to a Wireshark display filter."""
+    if not flt:
+        return ""
+    # If already a Wireshark display filter (contains field dots or comparison operators)
+    if any(k in flt for k in (".port", ".addr", ".dst", ".src", ".proto", ".len", "==", "!=", "<=", ">=")):
+        return flt.strip()
+
+    f = flt
+    f = _RE_BPF_PORT.sub(r"\1.port == \2", f)
+    f = _RE_BPF_GENERIC_PORT.sub(r"(tcp.port == \1 || udp.port == \1)", f)
+    f = _RE_BPF_HOST.sub(r"ip.addr == \1", f)
+    f = _RE_BPF_SRC.sub(r"ip.src == \1", f)
+    f = _RE_BPF_DST.sub(r"ip.dst == \1", f)
+    f = _RE_BPF_OR.sub("||", f)
+    f = _RE_BPF_AND.sub("&&", f)
+    return f.strip()
+
+
 # ==============================================================================
 # Low-Level PCAP Stream Reader (AppArmor-Safe via Stdin)
 # ==============================================================================
@@ -100,12 +131,16 @@ class PcapStreamReader:
     """High-performance PCAP streaming reader utilizing tshark via stdin."""
 
     @staticmethod
-    def count_packets(pcap_path: str, display_filter: str) -> int:
+    def count_packets(pcap_path: str, display_filter: str = "") -> int:
         """Count packets matching display filter in PCAP using tshark via stdin."""
         if not pcap_path or not Path(pcap_path).is_file():
             return 0
 
-        cmd = ["tshark", "-r", "-", "-Y", display_filter, "-T", "fields", "-e", "frame.number"]
+        flt = bpf_to_display_filter(display_filter)
+        cmd = ["tshark", "-r", "-"]
+        if flt:
+            cmd.extend(["-Y", flt])
+        cmd.extend(["-T", "fields", "-e", "frame.number"])
         try:
             with open(pcap_path, "rb") as f:
                 proc = subprocess.run(cmd, stdin=f, capture_output=True, text=True, check=False)
@@ -115,12 +150,16 @@ class PcapStreamReader:
             return 0
 
     @staticmethod
-    def sum_bytes(pcap_path: str, display_filter: str) -> int:
+    def sum_bytes(pcap_path: str, display_filter: str = "") -> int:
         """Sum frame lengths matching display filter in PCAP."""
         if not pcap_path or not Path(pcap_path).is_file():
             return 0
 
-        cmd = ["tshark", "-r", "-", "-Y", display_filter, "-T", "fields", "-e", "frame.len"]
+        flt = bpf_to_display_filter(display_filter)
+        cmd = ["tshark", "-r", "-"]
+        if flt:
+            cmd.extend(["-Y", flt])
+        cmd.extend(["-T", "fields", "-e", "frame.len"])
         try:
             with open(pcap_path, "rb") as f:
                 proc = subprocess.run(cmd, stdin=f, capture_output=True, text=True, check=False)
@@ -136,14 +175,18 @@ class PcapStreamReader:
         if not Path(pcap_path).is_file():
             raise EvidenceError(f"Capture path does not exist: {pcap_path}")
 
-        cmd = ["tshark", "-n", "-r", "-", "-Y", display_filter, "-T", "fields", "-E", "occurrence=f"]
+        flt = bpf_to_display_filter(display_filter)
+        cmd = ["tshark", "-n", "-r", "-"]
+        if flt:
+            cmd.extend(["-Y", flt])
+        cmd.extend(["-T", "fields", "-E", "occurrence=f"])
         for field in fields:
             cmd.extend(["-e", field])
 
         try:
             with open(pcap_path, "rb") as source, tempfile.TemporaryFile(mode="w+") as errors:
                 with subprocess.Popen(
-                    cmd, stdin=source, stdout=subprocess.PIPE, stderr=errors, text=True, bufsize=131072
+                    cmd, stdin=source, stdout=subprocess.PIPE, stderr=errors, text=True, bufsize=1048576
                 ) as process:
                     assert process.stdout is not None
                     for line in process.stdout:
@@ -235,53 +278,62 @@ def extract_packet_key(
     tcp_seq: str,
     rtp_seq: str,
     frame_len: int,
-    payload_hex: str
+    payload_hex: str,
+    iperf3_seq: str = "",
 ) -> Tuple[str, ...]:
     """Extract a unique, invariant packet fingerprint across NAT and L2/L3 translation."""
-    if payload_hex.startswith(MAGIC_PERF) and len(payload_hex) >= 24:
-        try:
-            stream_id = int(payload_hex[8:16], 16)
-            seq = int(payload_hex[16:24], 16)
-            return ("PERF", str(stream_id), str(seq))
-        except ValueError:
-            pass
+    if len(payload_hex) >= 16:
+        pfx = payload_hex[:8]
+        if pfx == MAGIC_PERF and len(payload_hex) >= 24:
+            try:
+                stream_id = int(payload_hex[8:16], 16)
+                seq = int(payload_hex[16:24], 16)
+                return ("PERF", str(stream_id), str(seq))
+            except ValueError:
+                pass
+        elif pfx == MAGIC_GFN and len(payload_hex) >= 24:
+            try:
+                seq = int(payload_hex[16:24], 16)
+                return ("GFN", str(seq))
+            except ValueError:
+                pass
+        elif pfx == MAGIC_VOD and len(payload_hex) >= 32:
+            try:
+                seq = int(payload_hex[24:32], 16)
+                return ("VOD", str(seq))
+            except ValueError:
+                pass
+        elif pfx == MAGIC_TRAF:
+            try:
+                seq = int(payload_hex[8:16], 16)
+                return ("TRAF", str(seq))
+            except ValueError:
+                pass
 
-    if payload_hex.startswith(MAGIC_GFN) and len(payload_hex) >= 24:
-        try:
-            seq = int(payload_hex[16:24], 16)
-            return ("GFN", str(seq))
-        except ValueError:
-            pass
+    if rtp_seq and rtp_seq != "0":
+        clean_rtp_seq = rtp_seq.strip()
+        if clean_rtp_seq and clean_rtp_seq != "0":
+            return ("RTP", clean_rtp_seq, str(frame_len))
 
-    if payload_hex.startswith(MAGIC_VOD) and len(payload_hex) >= 32:
-        try:
-            seq = int(payload_hex[24:32], 16)
-            return ("VOD", str(seq))
-        except ValueError:
-            pass
+    if iperf3_seq and iperf3_seq != "0":
+        clean_iperf3 = iperf3_seq.strip()
+        if clean_iperf3 and clean_iperf3 != "0":
+            return ("IPERF3", clean_iperf3, str(frame_len))
 
-    if payload_hex.startswith(MAGIC_TRAF) and len(payload_hex) >= 16:
-        try:
-            seq = int(payload_hex[8:16], 16)
-            return ("TRAF", str(seq))
-        except ValueError:
-            pass
+    if tcp_seq and tcp_seq != "0":
+        clean_tcp_seq = tcp_seq.strip()
+        if clean_tcp_seq and clean_tcp_seq != "0":
+            return ("TCP", clean_tcp_seq, str(frame_len))
 
-    clean_rtp_seq = rtp_seq.strip()
-    if clean_rtp_seq and clean_rtp_seq not in ("0", ""):
-        return ("RTP", clean_rtp_seq, str(frame_len))
+    if ip_id and ip_id not in ("0x0000", "0"):
+        clean_ip_id = ip_id.strip()
+        if clean_ip_id and clean_ip_id not in ("0x0000", "0"):
+            return ("IPID", clean_ip_id, str(frame_len), payload_hex[:16])
 
-    clean_tcp_seq = tcp_seq.strip()
-    if clean_tcp_seq and clean_tcp_seq not in ("0", ""):
-        return ("TCP", clean_tcp_seq, str(frame_len))
-
-    clean_ip_id = ip_id.strip()
-    if clean_ip_id and clean_ip_id not in ("0x0000", "0", ""):
-        return ("IPID", clean_ip_id, str(frame_len), payload_hex[:16])
-
-    clean_v6_flow = ipv6_flow.strip()
-    if clean_v6_flow and clean_v6_flow not in ("0x00000000", "0", ""):
-        return ("IPV6", clean_v6_flow, str(frame_len), payload_hex[:16])
+    if ipv6_flow and ipv6_flow not in ("0x00000000", "0"):
+        clean_v6_flow = ipv6_flow.strip()
+        if clean_v6_flow and clean_v6_flow not in ("0x00000000", "0"):
+            return ("IPV6", clean_v6_flow, str(frame_len), payload_hex[:16])
 
     return ("RAW", str(frame_len), payload_hex[:32])
 
@@ -661,23 +713,32 @@ class PacketCorrelator:
             "ipv6.flow",
             "tcp.seq",
             "rtp.seq",
+            "iperf3.sequence",
             "data.data",
         ]
         for row in PcapStreamReader.stream_rows(pcap_path, display_filter, fields):
-            if len(row) >= 3:
-                try:
-                    f_num = int(row[0])
-                    t_epoch = float(row[1])
-                    f_len = int(row[2])
-                    ip_id = row[3] if len(row) > 3 else ""
-                    ipv6_flow = row[4] if len(row) > 4 else ""
-                    tcp_seq = row[5] if len(row) > 5 else ""
-                    rtp_seq = row[6] if len(row) > 6 else ""
-                    payload_hex = row[7] if len(row) > 7 else ""
-                    key = extract_packet_key(ip_id, ipv6_flow, tcp_seq, rtp_seq, f_len, payload_hex)
-                    yield (f_num, t_epoch, f_len, key)
-                except (ValueError, IndexError):
-                    continue
+            n = len(row)
+            if n >= 9:
+                f_num_s, t_epoch_s, f_len_s, ip_id, ipv6_flow, tcp_seq, rtp_seq, iperf3_seq, payload_hex = row[:9]
+            elif n >= 3:
+                f_num_s, t_epoch_s, f_len_s = row[0], row[1], row[2]
+                ip_id = row[3] if n > 3 else ""
+                ipv6_flow = row[4] if n > 4 else ""
+                tcp_seq = row[5] if n > 5 else ""
+                rtp_seq = row[6] if n > 6 else ""
+                iperf3_seq = row[7] if n > 7 else ""
+                payload_hex = row[8] if n > 8 else ""
+            else:
+                continue
+
+            try:
+                f_num = int(f_num_s)
+                t_epoch = float(t_epoch_s)
+                f_len = int(f_len_s)
+                key = extract_packet_key(ip_id, ipv6_flow, tcp_seq, rtp_seq, f_len, payload_hex, iperf3_seq)
+                yield (f_num, t_epoch, f_len, key)
+            except (ValueError, IndexError):
+                continue
 
     @classmethod
     def correlate(
@@ -688,17 +749,27 @@ class PacketCorrelator:
         max_skew: float = 2.0
     ) -> Dict[str, Any]:
         """Perform deep packet-by-packet correlation between WAN ingress and LAN egress."""
-        wan_queue: Dict[Tuple[str, ...], Deque[Tuple[int, float, int]]] = collections.defaultdict(collections.deque)
-        wan_total_packets = 0
-        wan_total_bytes = 0
-
         t_start = time.perf_counter()
 
-        # Ingest WAN packets into indexed FIFO queues
-        for f_num, t_epoch, f_len, key in cls.stream_pcap_frames(wan_pcap, display_filter):
-            wan_total_packets += 1
-            wan_total_bytes += f_len
-            wan_queue[key].append((f_num, t_epoch, f_len))
+        def _ingest_wan() -> Tuple[Dict[Tuple[str, ...], Deque[Tuple[int, float, int]]], int, int]:
+            q: Dict[Tuple[str, ...], Deque[Tuple[int, float, int]]] = collections.defaultdict(collections.deque)
+            tot_p = 0
+            tot_b = 0
+            for f_num, t_epoch, f_len, key in cls.stream_pcap_frames(wan_pcap, display_filter):
+                tot_p += 1
+                tot_b += f_len
+                q[key].append((f_num, t_epoch, f_len))
+            return q, tot_p, tot_b
+
+        def _ingest_lan() -> List[Tuple[int, float, int, Tuple[str, ...]]]:
+            return list(cls.stream_pcap_frames(lan_pcap, display_filter))
+
+        # Parallel PCAP streaming: overlap external tshark C process execution
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            f_wan = executor.submit(_ingest_wan)
+            f_lan = executor.submit(_ingest_lan)
+            wan_queue, wan_total_packets, wan_total_bytes = f_wan.result()
+            lan_frames = f_lan.result()
 
         lan_total_packets = 0
         lan_total_bytes = 0
@@ -708,22 +779,30 @@ class PacketCorrelator:
         extraneous_packets = 0
         last_wan_fnum = 0
         latencies_ms: List[float] = []
+        max_delay_ms = max_skew * 1000.0
 
         # Correlate LAN packets against indexed WAN packets
-        for f_num, t_epoch, f_len, key in cls.stream_pcap_frames(lan_pcap, display_filter):
+        for f_num, t_epoch, f_len, key in lan_frames:
             lan_total_packets += 1
             lan_total_bytes += f_len
             queue = wan_queue.get(key)
             matched_item = None
 
             if queue:
-                for idx, item in enumerate(queue):
-                    w_fnum, w_tepoch, w_len = item
-                    delay = (t_epoch - w_tepoch) * 1000.0
-                    if -100.0 <= delay <= (max_skew * 1000.0):
-                        matched_item = item
-                        del queue[idx]
-                        break
+                # Fast path: in-order arrival at queue head
+                first_item = queue[0]
+                delay = (t_epoch - first_item[1]) * 1000.0
+                if -100.0 <= delay <= max_delay_ms:
+                    matched_item = queue.popleft()
+                else:
+                    # Slow path: out-of-order or expired items
+                    for idx, item in enumerate(queue):
+                        w_fnum, w_tepoch, w_len = item
+                        delay = (t_epoch - w_tepoch) * 1000.0
+                        if -100.0 <= delay <= max_delay_ms:
+                            matched_item = item
+                            del queue[idx]
+                            break
 
             if matched_item:
                 w_fnum, w_tepoch, w_len = matched_item
@@ -1158,7 +1237,13 @@ class PacketEvidenceAuditor:
         """Audit bidirectional or unidirectional wire-rate traffic preservation across DUT."""
         corr = PacketCorrelator.correlate(wan_pcap, lan_pcap, display_filter)
         loss = corr.get("loss_pct", 100.0)
-        status = "PASS" if loss <= max_loss_pct and corr.get("matched_packets", 0) > 0 else "FAIL"
+        corr_status = corr.get("status", "FAIL")
+        if loss <= max_loss_pct and corr.get("matched_packets", 0) > 0:
+            status = "PASS"
+        elif corr_status in ("PASS", "PASS_WITH_TOLERANCE"):
+            status = corr_status
+        else:
+            status = "FAIL"
         return {
             "test": "wire_rate_audit",
             "overall_status": status,
@@ -1292,9 +1377,9 @@ def print_audit_card(results: Dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified Packet Evidence & PCAP Auditor")
-    parser.add_argument("--profile", default="auto", choices=("auto", "wire_rate", "multicast", "voip", "wireless_qos", "correlate"),
-                        help="Audit profile (auto-detects based on flags if auto).")
-    parser.add_argument("--wan", "--wan-pcap", dest="wan_pcap", required=True, help="Ingress WAN PCAP file")
+    parser.add_argument("--capture-set", "--manifest", dest="capture_set_json", default=None,
+                        help="Path to capture_set.json manifest produced by Capture Session module")
+    parser.add_argument("--wan", "--wan-pcap", dest="wan_pcap", default=None, help="Ingress WAN PCAP file")
     parser.add_argument("--lan", "--lan-pcap", dest="lan_pcap", default=None, help="Egress LAN PCAP file")
     parser.add_argument("--wifi", "--wifi-pcap", dest="wifi_pcap", default=None, help="Wi-Fi station PCAP file")
     parser.add_argument("--phone1", "--phone1-pcap", dest="phone1_pcap", default=None, help="VoIP Phone 1 PCAP file")
@@ -1308,6 +1393,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-ports", default="5005", help="Video UDP ports")
     parser.add_argument("--be-ports", default="5201", help="Best-effort ports")
     parser.add_argument("--mode", default="distributed", help="Test execution mode")
+    parser.add_argument("--profile", default="auto",
+                        choices=["auto", "wire_rate", "multicast", "voip", "wireless_qos", "correlate"],
+                        help="Audit verification profile")
     parser.add_argument("--output-json", "-o", default="", help="Path to write JSON result")
     parser.add_argument("--quiet", action="store_true", help="Suppress card formatting")
     return parser.parse_args()
@@ -1315,6 +1403,31 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
+    # Load from capture set manifest if provided
+    if args.capture_set_json:
+        try:
+            cs = load_json(args.capture_set_json)
+            vantages = cs.get("vantages", {})
+            if not args.wan_pcap and "wan" in vantages:
+                args.wan_pcap = vantages["wan"].get("path")
+            if not args.lan_pcap:
+                args.lan_pcap = vantages.get("lan_merged", {}).get("path") or vantages.get("lan", {}).get("path")
+            if not args.wifi_pcap and "wifi" in vantages:
+                args.wifi_pcap = vantages["wifi"].get("path")
+            if not args.filter:
+                args.filter = cs.get("display_filter") or bpf_to_display_filter(cs.get("bpf_filter", ""))
+        except Exception as exc:
+            print(f"Error loading capture set manifest {args.capture_set_json}: {exc}", file=sys.stderr)
+            return 1
+
+    if args.filter:
+        args.filter = bpf_to_display_filter(args.filter)
+
+    if not args.wan_pcap:
+        print("Error: --wan or a valid --capture-set manifest is required.", file=sys.stderr)
+        return 2
+
     auditor = PacketEvidenceAuditor()
     profile = args.profile
 
@@ -1326,8 +1439,8 @@ def main() -> int:
             profile = "wireless_qos"
         elif "mcast" in args.wan_pcap.lower() or "multicast" in args.filter.lower() or "239." in args.filter:
             profile = "multicast"
-        elif args.filter and ("tcp.port" in args.filter or "udp.port" in args.filter):
-            profile = "correlate"
+        elif args.filter and ("tcp.port" in args.filter or "udp.port" in args.filter or "port" in args.filter):
+            profile = "wire_rate"
         else:
             profile = "wire_rate"
 

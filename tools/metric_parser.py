@@ -7,6 +7,9 @@ tools/benchmark_evaluator.py. Preserves all 8 canonical CLI subcommands.
 """
 
 import argparse
+from datetime import datetime, timezone
+import json
+import os
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Tuple
@@ -147,6 +150,155 @@ def cmd_get_metrics(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_eval_stream(args: argparse.Namespace) -> int:
+    """Parse and evaluate single stream test results (iperf3, UDP, TCP)."""
+    res = BenchmarkEvaluator.evaluate_stream(
+        input_file=args.input,
+        output_file=getattr(args, "output", None),
+        proto=getattr(args, "proto", "udp"),
+        duration=float(getattr(args, "duration", 10.0)),
+        target_bitrate=getattr(args, "target_bitrate", "500M"),
+        max_loss_pct=float(getattr(args, "max_loss_pct", 0.5)),
+        test_name=getattr(args, "test_name", "template_throughput"),
+        scenario=getattr(args, "scenario", "template"),
+        as_json=getattr(args, "json", False)
+    )
+    if getattr(args, "json", False):
+        print(res.to_json())
+    else:
+        print(res.rendered_table)
+    return res.exit_code
+
+
+def cmd_write_manifest(args: argparse.Namespace) -> int:
+    """Safely and atomically write a capture_set.json manifest."""
+    manifest = {
+        "tag": args.tag,
+        "timestamp": args.timestamp,
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "bpf_filter": getattr(args, "bpf_filter", "") or "",
+        "display_filter": getattr(args, "display_filter", "") or "",
+        "snaplen": int(args.snaplen) if getattr(args, "snaplen", None) else 96,
+        "vantages": {
+            "wan": {
+                "path": getattr(args, "wan_pcap", "") or "",
+                "frame_count": int(args.wan_frames) if getattr(args, "wan_frames", None) else 0,
+            },
+            "lan": {
+                "path": getattr(args, "lan_pcap", "") or "",
+                "frame_count": int(args.lan_frames) if getattr(args, "lan_frames", None) else 0,
+            },
+            "wifi": {
+                "path": getattr(args, "wifi_pcap", "") or "",
+                "frame_count": int(args.wifi_frames) if getattr(args, "wifi_frames", None) else 0,
+            },
+            "lan_merged": {
+                "path": getattr(args, "merged_lan_pcap", "") or "",
+            },
+        },
+    }
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_suffix(f".tmp.{os.getpid()}")
+    tmp_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(out_path)
+    return 0
+
+
+def cmd_write_bundle_manifest(args: argparse.Namespace) -> int:
+    """Safely and atomically write an artifact bundle manifest.json."""
+    counts = {}
+    if getattr(args, "counts", None):
+        for pair in args.counts:
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                try:
+                    counts[k] = int(v)
+                except ValueError:
+                    counts[k] = v
+
+    manifest: Dict[str, Any] = {
+        "artifact_bundle": args.bundle_name,
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if getattr(args, "git_commit", None):
+        manifest["git_commit"] = args.git_commit
+    if getattr(args, "git_branch", None):
+        manifest["git_branch"] = args.git_branch
+    if getattr(args, "dut_lan_ip", None):
+        manifest["dut_lan_ip"] = args.dut_lan_ip
+    if getattr(args, "dut_wan_ip", None):
+        manifest["dut_wan_ip"] = args.dut_wan_ip
+    if getattr(args, "dut_host", None):
+        manifest["dut_host"] = args.dut_host
+    if getattr(args, "dut_user", None):
+        manifest["dut_user"] = args.dut_user
+    if counts:
+        manifest["counts"] = counts
+    if getattr(args, "total_files", None) is not None:
+        try:
+            manifest["total_files"] = int(args.total_files)
+        except ValueError:
+            manifest["total_files"] = args.total_files
+    if getattr(args, "total_size", None):
+        manifest["total_size"] = str(args.total_size)
+    if getattr(args, "total_bytes", None) is not None:
+        try:
+            manifest["total_bytes"] = int(args.total_bytes)
+        except ValueError:
+            manifest["total_bytes"] = args.total_bytes
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_suffix(f".tmp.{os.getpid()}")
+    tmp_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(out_path)
+    return 0
+
+
+def cmd_write_ap_edca(args: argparse.Namespace) -> int:
+    """Safely write ap_edca.json from parsed EDCA parameters."""
+    doc = {
+        "source": getattr(args, "source", None) or f"DUT wl CLI [{getattr(args, 'interface', 'unknown')}]",
+        "dut_host": getattr(args, "dut_host", "") or "",
+        "interface": getattr(args, "interface", "") or "",
+        "bssid": getattr(args, "bssid", "") or "",
+        "chanspec": getattr(args, "chanspec", "") or "",
+        "selection_rule": getattr(args, "selection_rule", "explicit") or "explicit",
+        "collected_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "AC_VO": {
+            "aifsn": int(args.vo_aifsn),
+            "cwmin": int(args.vo_cwmin),
+            "cwmax": int(args.vo_cwmax),
+            "txop_limit_us": int(args.vo_txop),
+        },
+        "AC_VI": {
+            "aifsn": int(args.vi_aifsn),
+            "cwmin": int(args.vi_cwmin),
+            "cwmax": int(args.vi_cwmax),
+            "txop_limit_us": int(args.vi_txop),
+        },
+        "AC_BE": {
+            "aifsn": int(args.be_aifsn),
+            "cwmin": int(args.be_cwmin),
+            "cwmax": int(args.be_cwmax),
+            "txop_limit_us": int(args.be_txop),
+        },
+        "AC_BK": {
+            "aifsn": int(args.bk_aifsn),
+            "cwmin": int(args.bk_cwmin),
+            "cwmax": int(args.bk_cwmax),
+            "txop_limit_us": int(args.bk_txop),
+        },
+    }
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_suffix(f".tmp.{os.getpid()}")
+    tmp_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(out_path)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Metric aggregator and performance result analyzer for network test labs."
@@ -234,12 +386,85 @@ def main() -> int:
     p_wqos.add_argument("--traffic-error", default="", help="Generator startup or execution failure.")
     p_wqos.set_defaults(func=cmd_eval_wireless_qos)
 
-    # 9. get-metrics (Batch query helper)
-    p_m = subparsers.add_parser("get-metrics", help="Batch extract multiple fields from a JSON file.")
+    # 9. get-metrics / query-metrics (Batch query helper)
+    p_m = subparsers.add_parser("get-metrics", aliases=["query-metrics"], help="Batch extract multiple fields from a JSON file.")
     p_m.add_argument("--file", "-f", required=True, help="Path to JSON file.")
     p_m.add_argument("fields", nargs="+", help="Fields to extract.")
     p_m.add_argument("--default", "-d", default="MISSING", help="Default fallback value.")
     p_m.set_defaults(func=cmd_get_metrics)
+
+    # 10. eval-stream
+    p_es = subparsers.add_parser("eval-stream", help="Parse and evaluate single stream test results (iperf3, UDP, TCP).")
+    p_es.add_argument("--input", "-i", required=True, help="Path to raw stream client JSON.")
+    p_es.add_argument("--output", "-o", help="Optional path to output evaluation JSON.")
+    p_es.add_argument("--proto", default="udp", help="Transport protocol (udp/tcp).")
+    p_es.add_argument("--duration", type=float, default=10.0, help="Test duration in seconds.")
+    p_es.add_argument("--target-bitrate", default="500M", help="Target stream bitrate.")
+    p_es.add_argument("--max-loss-pct", type=float, default=0.5, help="Max loss percent threshold.")
+    p_es.add_argument("--test-name", default="template_throughput", help="Canonical test name.")
+    p_es.add_argument("--scenario", default="template", help="Scenario identifier.")
+    p_es.add_argument("--json", action="store_true", help="Output raw JSON.")
+    p_es.set_defaults(func=cmd_eval_stream)
+
+    # 11. write-manifest (Capture Set manifest generator)
+    p_wm = subparsers.add_parser("write-manifest", help="Atomically write a valid capture_set.json manifest.")
+    p_wm.add_argument("--output", "-o", required=True, help="Destination manifest path.")
+    p_wm.add_argument("--tag", "-t", default="test", help="Test tag.")
+    p_wm.add_argument("--timestamp", default="", help="Session timestamp.")
+    p_wm.add_argument("--bpf-filter", default="", help="Active BPF filter.")
+    p_wm.add_argument("--display-filter", default="", help="Wireshark display filter.")
+    p_wm.add_argument("--snaplen", type=int, default=96, help="Snaplen in bytes.")
+    p_wm.add_argument("--wan-pcap", default="", help="WAN PCAP file path.")
+    p_wm.add_argument("--wan-frames", type=int, default=0, help="WAN captured packet count.")
+    p_wm.add_argument("--lan-pcap", default="", help="LAN PCAP file path.")
+    p_wm.add_argument("--lan-frames", type=int, default=0, help="LAN captured packet count.")
+    p_wm.add_argument("--wifi-pcap", default="", help="Wi-Fi PCAP file path.")
+    p_wm.add_argument("--wifi-frames", type=int, default=0, help="Wi-Fi captured packet count.")
+    p_wm.add_argument("--merged-lan-pcap", default="", help="Merged LAN PCAP file path.")
+    p_wm.set_defaults(func=cmd_write_manifest)
+
+    # 12. write-bundle-manifest (Diagnostic & artifact bundle manifest generator)
+    p_wbm = subparsers.add_parser("write-bundle-manifest", help="Atomically write an artifact bundle manifest.json.")
+    p_wbm.add_argument("--output", "-o", required=True, help="Destination manifest.json path.")
+    p_wbm.add_argument("--bundle-name", "-b", required=True, help="Bundle identifier.")
+    p_wbm.add_argument("--git-commit", default="", help="Git commit hash.")
+    p_wbm.add_argument("--git-branch", default="", help="Git branch name.")
+    p_wbm.add_argument("--dut-lan-ip", default="", help="DUT LAN IP.")
+    p_wbm.add_argument("--dut-wan-ip", default="", help="DUT WAN IP.")
+    p_wbm.add_argument("--dut-host", default="", help="DUT hostname/IP.")
+    p_wbm.add_argument("--dut-user", default="", help="DUT SSH username.")
+    p_wbm.add_argument("--total-files", type=int, default=None, help="Total collected files count.")
+    p_wbm.add_argument("--total-size", default="", help="Total human-readable bundle size.")
+    p_wbm.add_argument("--total-bytes", type=int, default=None, help="Total size in bytes.")
+    p_wbm.add_argument("--counts", nargs="*", default=None, help="Key=Value metric counts.")
+    p_wbm.set_defaults(func=cmd_write_bundle_manifest)
+
+    # 13. write-ap-edca (AP-side EDCA parameters JSON generator)
+    p_wae = subparsers.add_parser("write-ap-edca", help="Safely generate ap_edca.json from parsed parameters.")
+    p_wae.add_argument("--output", "-o", required=True, help="Destination ap_edca.json path.")
+    p_wae.add_argument("--source", default="", help="Data source description.")
+    p_wae.add_argument("--dut-host", default="", help="DUT target host.")
+    p_wae.add_argument("--interface", default="", help="Wireless interface.")
+    p_wae.add_argument("--bssid", default="", help="BSSID.")
+    p_wae.add_argument("--chanspec", default="", help="Channel specification.")
+    p_wae.add_argument("--selection-rule", default="explicit", help="Interface selection rule.")
+    p_wae.add_argument("--vo-aifsn", type=int, default=2, help="AC_VO AIFSN.")
+    p_wae.add_argument("--vo-cwmin", type=int, default=3, help="AC_VO CWmin.")
+    p_wae.add_argument("--vo-cwmax", type=int, default=7, help="AC_VO CWmax.")
+    p_wae.add_argument("--vo-txop", type=int, default=1504, help="AC_VO TXOP limit us.")
+    p_wae.add_argument("--vi-aifsn", type=int, default=2, help="AC_VI AIFSN.")
+    p_wae.add_argument("--vi-cwmin", type=int, default=7, help="AC_VI CWmin.")
+    p_wae.add_argument("--vi-cwmax", type=int, default=15, help="AC_VI CWmax.")
+    p_wae.add_argument("--vi-txop", type=int, default=3008, help="AC_VI TXOP limit us.")
+    p_wae.add_argument("--be-aifsn", type=int, default=3, help="AC_BE AIFSN.")
+    p_wae.add_argument("--be-cwmin", type=int, default=15, help="AC_BE CWmin.")
+    p_wae.add_argument("--be-cwmax", type=int, default=1023, help="AC_BE CWmax.")
+    p_wae.add_argument("--be-txop", type=int, default=0, help="AC_BE TXOP limit us.")
+    p_wae.add_argument("--bk-aifsn", type=int, default=7, help="AC_BK AIFSN.")
+    p_wae.add_argument("--bk-cwmin", type=int, default=15, help="AC_BK CWmin.")
+    p_wae.add_argument("--bk-cwmax", type=int, default=1023, help="AC_BK CWmax.")
+    p_wae.add_argument("--bk-txop", type=int, default=0, help="AC_BK TXOP limit us.")
+    p_wae.set_defaults(func=cmd_write_ap_edca)
 
     args = parser.parse_args()
     return args.func(args)

@@ -65,6 +65,25 @@ print_namespaces_section() {
         "${PHONE2_NS:-ns-phone2}:Wi-Fi Phone 2 (VoIP):VIRTUAL:v-ph2-h:${DUT_SSID_VOIP:-${DUT_SSID_5G:-DUT_5G}}:5GHz VoIP:1"
     )
 
+    # Dynamic Discovery: Append any active custom netns created by user scenarios
+    if command -v ip >/dev/null 2>&1; then
+        local discovered_ns
+        discovered_ns="$(ip netns list 2>/dev/null | awk '{print $1}' || true)"
+        for dns in ${discovered_ns}; do
+            local already=0
+            for ep in "${all_endpoints[@]}"; do
+                local ep_ns="${ep%%:*}"
+                if [[ "${ep_ns}" == "${dns}" ]]; then
+                    already=1
+                    break
+                fi
+            done
+            if (( already == 0 )); then
+                all_endpoints+=("${dns}:Custom Endpoint:VIRTUAL:-:-:-:0")
+            fi
+        done
+    fi
+
     # 3. Print Unified Summary Table
     printf '%-19s %-20s %-10s %-22s %-24s %-15s %-14s %-12s\n' \
         "Target / Namespace" "Role" "Type" "Medium" "SSID (Target/Connected)" "IPv4 Address" "Gateway" "Status"

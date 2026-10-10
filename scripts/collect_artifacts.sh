@@ -346,26 +346,30 @@ main() {
     local total_bytes
     total_bytes="$(du -sb "${bundle_dir}" 2>/dev/null | awk '{print $1}' || echo "0")"
 
-    cat << EOF > "${bundle_dir}/manifest.json"
-{
-  "artifact_bundle": "${bundle_name}",
-  "created_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
-  "git_commit": "$(git rev-parse HEAD 2>/dev/null || echo "N/A")",
-  "git_branch": "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "N/A")",
-  "dut_lan_ip": "${DUT_LAN_IP:-192.168.1.1}",
-  "dut_wan_ip": "${DUT_WAN_IP:-10.10.0.100}",
-  "counts": {
-    "metrics_json": ${cnt_metrics},
-    "raw_iperf_json": ${cnt_raw},
-    "logs": ${cnt_logs},
-    "captures_pcap": ${cnt_pcap},
-    "state_files": ${cnt_state},
-    "dut_artifacts": ${cnt_dut},
-    "total_files": ${total_files}
-  },
-  "total_bytes": ${total_bytes}
-}
-EOF
+    local git_rev git_br
+    git_rev="$(git rev-parse HEAD 2>/dev/null || echo "N/A")"
+    git_br="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "N/A")"
+    local metric_tool="${LAB_DIR}/tools/metric_parser.py"
+
+    if [[ -f "${metric_tool}" ]]; then
+        "${PYTHON_BIN:-python3}" "${metric_tool}" write-bundle-manifest \
+            --output "${bundle_dir}/manifest.json" \
+            --bundle-name "${bundle_name}" \
+            --git-commit "${git_rev}" \
+            --git-branch "${git_br}" \
+            --dut-lan-ip "${DUT_LAN_IP:-192.168.1.1}" \
+            --dut-wan-ip "${DUT_WAN_IP:-10.10.0.100}" \
+            --total-files "${total_files}" \
+            --total-bytes "${total_bytes}" \
+            --counts \
+                "metrics_json=${cnt_metrics}" \
+                "raw_iperf_json=${cnt_raw}" \
+                "logs=${cnt_logs}" \
+                "captures_pcap=${cnt_pcap}" \
+                "state_files=${cnt_state}" \
+                "dut_artifacts=${cnt_dut}" \
+                "total_files=${total_files}" 2>/dev/null || true
+    fi
 
     # 8. Generate Summary Markdown Report
     {

@@ -20,6 +20,7 @@ from evidence_auditor import (
     PacketEvidenceAuditor,
     PcapStreamReader,
     VoipStreamAuditor,
+    bpf_to_display_filter,
     extract_packet_key,
     load_json,
     rtp_jitter,
@@ -94,6 +95,26 @@ class EvidenceAuditorTests(unittest.TestCase):
         # Fallback to RTP sequence
         key = extract_packet_key("", "", "", "105", 200, "11223344")
         self.assertEqual(key, ("RTP", "105", "200"))
+
+        # iPerf3 sequence key
+        key = extract_packet_key("", "", "", "", 1400, "", "42")
+        self.assertEqual(key, ("IPERF3", "42", "1400"))
+
+    def test_bpf_to_display_filter(self):
+        """Verify BPF capture filters are converted to valid Wireshark display filters."""
+        self.assertEqual(
+            bpf_to_display_filter("udp port 5201 or tcp port 5201"),
+            "udp.port == 5201 || tcp.port == 5201",
+        )
+        self.assertEqual(
+            bpf_to_display_filter("host 10.10.0.1 and port 5003"),
+            "ip.addr == 10.10.0.1 && (tcp.port == 5003 || udp.port == 5003)",
+        )
+        self.assertEqual(
+            bpf_to_display_filter("udp.port == 5201 || tcp.port == 5201"),
+            "udp.port == 5201 || tcp.port == 5201",
+        )
+        self.assertEqual(bpf_to_display_filter(""), "")
 
     def test_rtp_jitter_math(self):
         """Verify RFC 3550 jitter calculation matches standard formula."""

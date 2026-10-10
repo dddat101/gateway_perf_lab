@@ -7,31 +7,56 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+# Guard against duplicate inclusion
+if [[ -n "${_NWLAB_COMMON_LIB_LOADED:-}" ]]; then
+    return 0
+fi
+readonly _NWLAB_COMMON_LIB_LOADED=1
+
 readonly SCRIPT_LIB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly PROJECT_ROOT="$(cd -- "${SCRIPT_LIB_DIR}/../.." && pwd -P)"
 readonly CONFIG_FILE="${PROJECT_ROOT}/config.env"
 readonly LOG_TAG="LAB-FRAMEWORK"
+: "${LOG_DATE_FORMAT:=%Y-%m-%d %H:%M:%S}"
 
 # 1. Logging & Terminal Output
-log_info()    { printf '\e[1;32m[INFO]\e[0m    %s\n' "$*"; }
-log_success() { printf '\e[1;32m[PASS]\e[0m    %s\n' "$*"; }
+format_log_time() {
+    local fmt="${1:-${LOG_DATE_FORMAT:-%Y-%m-%d %H:%M:%S}}"
+    if [[ -z "${fmt}" || "${fmt,,}" == "none" || "${fmt,,}" == "off" || "${fmt}" == "0" ]]; then
+        return 0
+    fi
+    fmt="${fmt#+}"
+    printf "%(${fmt})T" -1 2>/dev/null || date "+${fmt}"
+}
+log_format_time() { format_log_time "$@"; }
+
+_log_prefix() {
+    local ts
+    ts="$(format_log_time)"
+    if [[ -n "${ts}" ]]; then
+        printf '[%s] ' "${ts}"
+    fi
+}
+
+log_info()    { printf '%s\e[1;32m[INFO]\e[0m    %s\n' "$(_log_prefix)" "$*"; }
+log_success() { printf '%s\e[1;32m[PASS]\e[0m    %s\n' "$(_log_prefix)" "$*"; }
 log_pass()    { log_success "$*"; }
-log_warn()    { printf '\e[1;33m[WARN]\e[0m    %s\n' "$*" >&2; }
-log_error()   { printf '\e[1;31m[ERROR]\e[0m   %s\n' "$*" >&2; }
-log_step()    { printf '\e[1;36m===> %s\e[0m\n' "$*"; }
+log_warn()    { printf '%s\e[1;33m[WARN]\e[0m    %s\n' "$(_log_prefix)" "$*" >&2; }
+log_error()   { printf '%s\e[1;31m[ERROR]\e[0m   %s\n' "$(_log_prefix)" "$*" >&2; }
+log_step()    { printf '%s\e[1;36m===> %s\e[0m\n' "$(_log_prefix)" "$*"; }
 die()         { log_error "$*"; exit 1; }
 fatal()       { die "$@"; }
 
 log_debug() {
     if [[ "${DEBUG:-0}" == "1" || "${VERBOSE:-0}" == "1" ]]; then
-        printf '\e[1;34m[DEBUG]\e[0m   %s\n' "$*" >&2
+        printf '%s\e[1;34m[DEBUG]\e[0m   %s\n' "$(_log_prefix)" "$*" >&2
     fi
 }
 
 log_cmd() {
     if [[ "${DEBUG:-0}" == "1" || "${VERBOSE:-0}" == "1" ]]; then
         local IFS=' '
-        printf '\e[1;34m[DEBUG]\e[0m   CMD: %s\n' "$*" >&2
+        printf '%s\e[1;34m[DEBUG]\e[0m   CMD: %s\n' "$(_log_prefix)" "$*" >&2
     fi
 }
 
@@ -96,6 +121,8 @@ load_config() {
     : "${LOG_DIR:=${PROJECT_ROOT}/logs}"
     : "${STATE_DIR:=${PROJECT_ROOT}/state}"
     : "${NS_IF:=eth-wan}"
+    : "${LOG_DATE_FORMAT:=%Y-%m-%d %H:%M:%S}"
+    export LOG_DATE_FORMAT
 
     # Auto-detect Python Virtualenv
     if [[ -z "${PYTHON_BIN:-}" ]]; then
@@ -469,10 +496,20 @@ stop_process_by_pattern() {
 # 7. Socket & Port Synchronization
 is_port_listening() {
     local port="$1" host="${2:-127.0.0.1}" ns="${3:-}"
+
+    # Try passive ss check first to avoid disrupting one-off servers
     if [[ -n "${ns}" ]] && ns_exists "${ns}"; then
-        ip netns exec "${ns}" python3 -c "import socket; s = socket.socket(); s.settimeout(0.5); s.connect(('${host}', int(${port}))); s.close()" >/dev/null 2>&1
+        if ip netns exec "${ns}" ss -H -lutn "sport = :${port}" 2>/dev/null | grep -qw -- "${port}"; then
+            return 0
+        fi
+        ip netns exec "${ns}" bash -c "timeout 0.5 bash -c '(echo >/dev/tcp/${host}/${port}) 2>/dev/null'" 2>/dev/null
     else
-        python3 -c "import socket; s = socket.socket(); s.settimeout(0.5); s.connect(('${host}', int(${port}))); s.close()" >/dev/null 2>&1
+        if [[ "${host}" == "127.0.0.1" || "${host}" == "localhost" || "${host}" == "::1" ]]; then
+            if ss -H -lutn "sport = :${port}" 2>/dev/null | grep -qw -- "${port}"; then
+                return 0
+            fi
+        fi
+        bash -c "timeout 0.5 bash -c '(echo >/dev/tcp/${host}/${port}) 2>/dev/null'" 2>/dev/null
     fi
 }
 

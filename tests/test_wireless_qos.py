@@ -299,6 +299,8 @@ class ClientAndShellTests(unittest.TestCase):
         self.assertEqual(qos.min_throughput_mbps, 0)
         self.assertEqual(qos.max_loss_pct, 1)
 
+    @unittest.skipUnless((ROOT / "scripts/scenarios/06_wireless_qos.sh").exists(),
+                         "Legacy 06_wireless_qos.sh scenario removed")
     def test_remote_no_capture_fetches_fresh_metrics_and_udp_unlimited(self):
         with tempfile.TemporaryDirectory() as td:
             p = Path(td)
@@ -374,6 +376,8 @@ run_phase_wireless_qos
             self.assertEqual(result["overall_status"], "INVALID")
             self.assertIsNone(result["services"]["video"]["dscp_preservation_pct"])
 
+    @unittest.skipUnless((ROOT / "scripts/scenarios/06_wireless_qos.sh").exists(),
+                         "Legacy 06_wireless_qos.sh scenario removed")
     def test_rate_units_and_unlimited(self):
         run = subprocess.run(["bash", "-c", 'source scripts/scenarios/06_wireless_qos.sh; '
                               '_wqos_calc_stream_bitrate 100000000 4; '

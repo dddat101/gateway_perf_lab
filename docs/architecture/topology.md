@@ -118,7 +118,7 @@ Using an official public IP range guarantees:
 When deploying against a physical gateway DUT, the DUT must receive an IP address within the `203.0.113.0/24` subnet on its WAN interface.
 
 ### Method A: Automated WAN DHCP Server (Recommended — Zero-Config)
-The upstream WAN DHCP service is managed via [`scripts/wan_server.sh`](file:///home/dddat/workspace/gwlab/scripts/wan_server.sh), which controls dual-stack Kea DHCPv4 and lightweight `dnsmasq` DHCP fallback inside the `ns-wan` namespace:
+The upstream WAN DHCP service is managed via [`scripts/wan_server.sh`](../../scripts/wan_server.sh), which controls dual-stack Kea DHCPv4 and lightweight `dnsmasq` DHCP fallback inside the `ns-wan` namespace:
 - Leases IP addresses within `203.0.113.100` – `203.0.113.200`.
 - Automatically advertises `203.0.113.1` as Default Gateway and `8.8.8.8` as public DNS.
 - Requires zero manual intervention on the DUT if its WAN port runs in DHCP client mode.
@@ -150,7 +150,7 @@ ip route show
 ```
 
 ### Method C: Dynamic DHCP Client on Downstream LAN Devices
-To verify the DUT LAN DHCP server (`br0`), LAN endpoints (`ns-pc`, `ns-stb`, `ns-phone*`, `ns-wlan*`) can acquire dynamic leases using [`scripts/client_dhcp.sh`](file:///home/dddat/workspace/gwlab/scripts/client_dhcp.sh):
+To verify the DUT LAN DHCP server (`br0`), LAN endpoints (`ns-pc`, `ns-stb`, `ns-phone*`, `ns-wlan*`) can acquire dynamic leases using [`scripts/client_dhcp.sh`](../../scripts/client_dhcp.sh):
 - Uses namespace-safe event scripts (`scripts/lib/udhcpc.script`) without altering host `/etc/resolv.conf`.
 - Sends custom Hostname (Option 12) and Vendor Class Identifier (Option 60) signaling.
 - Falls back to static addressing if the DUT DHCP server is unreachable.
@@ -174,7 +174,7 @@ sudo ./scripts/client_dhcp.sh release
 
 ## 5. Physical Wiring & Adapter Configuration
 
-Configure physical network adapters in [`config.env`](file:///home/dddat/workspace/gwlab/config.env):
+Configure physical network adapters in [`config.env`](../../config.env):
 
 ```bash
 # 1. Enable Physical Topology Mode

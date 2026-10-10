@@ -245,6 +245,19 @@ traffic_run_bg() {
     return 0
 }
 
+# Convenience wrapper matching framework specification
+# Usage: orchestrator_start_ns_bg <job_id> <netns> <stdout_log> [stderr_log] <cmd...>
+orchestrator_start_ns_bg() {
+    local job_id="$1"
+    local ns="$2"
+    local stdout_log="$3"
+    shift 3
+    if [[ $# -gt 0 && ( "$1" == *.log || "$1" == /dev/null || "$1" == *err* ) ]]; then
+        shift 1
+    fi
+    traffic_run_bg --job "${job_id}" --netns "${ns}" --out "${stdout_log}" "$@"
+}
+
 # Start background server daemon with optional port readiness polling
 # Usage: traffic_start_server [--job <id>] [--netns <ns>] [--port <port>] [--out <logfile>] [--ready-timeout <sec>] <cmd...>
 traffic_start_server() {

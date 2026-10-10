@@ -4,6 +4,11 @@
 # Shared Trap Handlers, Dual Packet Capture Orchestrator, & Endpoint Setup
 # ==============================================================================
 
+if [[ -n "${_NWLAB_SCENARIO_COMMON_LOADED:-}" ]]; then
+    return 0
+fi
+readonly _NWLAB_SCENARIO_COMMON_LOADED=1
+
 # Source centralized Traffic Process Supervisor and Running Mode Orchestrator
 _SCN_COMMON_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 if [[ -f "${_SCN_COMMON_DIR}/traffic_orchestrator.sh" ]]; then
@@ -14,7 +19,43 @@ if [[ -f "${_SCN_COMMON_DIR}/orchestrator_mode.sh" ]]; then
     # shellcheck source=lib/orchestrator_mode.sh
     source "${_SCN_COMMON_DIR}/orchestrator_mode.sh"
 fi
+if [[ -f "${_SCN_COMMON_DIR}/scenario_framework.sh" ]]; then
+    # shellcheck source=lib/scenario_framework.sh
+    source "${_SCN_COMMON_DIR}/scenario_framework.sh"
+fi
+if [[ -f "${_SCN_COMMON_DIR}/capture_session.sh" ]]; then
+    # shellcheck source=lib/capture_session.sh
+    source "${_SCN_COMMON_DIR}/capture_session.sh"
+fi
 unset _SCN_COMMON_DIR
+
+# Generic bitrate calculator per stream
+calc_stream_bitrate() {
+    local total="$1"
+    local streams="${2:-1}"
+
+    if [[ -z "${total}" || "${total}" == "0" || "${total,,}" == "unlimited" || "${total,,}" == "none" ]]; then
+        echo "0"
+        return 0
+    fi
+
+    local clean="${total^^}"
+    clean="${clean%BPS}"
+    clean="${clean%/S}"
+    clean="${clean%B}"
+    if [[ ! "${streams}" =~ ^[1-9][0-9]*$ || ! "${clean}" =~ ^([0-9]+([.][0-9]+)?)([KMG]?)$ ]]; then
+        printf 'Invalid rate or stream count: %s / %s\n' "${total}" "${streams}" >&2
+        return 1
+    fi
+    local num="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[3]}"
+    awk -v num="${num}" -v unit="${unit}" -v streams="${streams}" 'BEGIN {
+        factor = unit == "G" ? 1000000000 : unit == "M" ? 1000000 : unit == "K" ? 1000 : 1;
+        rate = num * factor / streams;
+        if (rate < 1) exit 1;
+        printf "%.0f\n", rate;
+    }'
+}
+_wqos_calc_stream_bitrate() { calc_stream_bitrate "$@"; }
 
 # Defensive cleanup trap: cleans up temporary directory, background PIDs, and active captures
 cleanup_scenario_trap() {
@@ -95,7 +136,7 @@ run_with_dual_capture() {
     local lan_ns="$2"
     local bpf_filter="$3"
     local wifi_target="${4:-}"
-    if [[ "${wifi_target}" =~ ^run_ ]]; then
+    if declare -F "${wifi_target}" >/dev/null 2>&1 || [[ "${wifi_target}" =~ ^(run_|template_) ]]; then
         wifi_target=""
         shift 3
     else
@@ -108,24 +149,50 @@ run_with_dual_capture() {
         fi
     fi
 
-    if (( DRY_RUN == 0 && NO_CAPTURE == 0 )) && [[ -x "${SCRIPT_DIR}/capture.sh" ]]; then
-        log_cmd "${SCRIPT_DIR}/capture.sh start_dual \"${tag}\" \"${lan_ns}\" \"${bpf_filter}\" \"${CAPTURE_SNAPLEN:-96}\" \"${wifi_target}\""
-        "${SCRIPT_DIR}/capture.sh" start_dual "${tag}" "${lan_ns}" "${bpf_filter}" "${CAPTURE_SNAPLEN:-96}" "${wifi_target}" || true
+    if (( DRY_RUN == 0 && NO_CAPTURE == 0 )); then
+        if declare -F capture_session_start >/dev/null 2>&1; then
+            log_cmd "capture_session_start --tag \"${tag}\" --lan-ns \"${lan_ns}\" --bpf \"${bpf_filter}\" --snaplen \"${CAPTURE_SNAPLEN:-96}\" ${wifi_target:+--wifi-if \"${wifi_target}\"}"
+            capture_session_start --tag "${tag}" --lan-ns "${lan_ns}" --bpf "${bpf_filter}" --snaplen "${CAPTURE_SNAPLEN:-96}" ${wifi_target:+--wifi-if "${wifi_target}"} || true
+        elif [[ -x "${SCRIPT_DIR}/capture.sh" ]]; then
+            log_cmd "${SCRIPT_DIR}/capture.sh start_dual \"${tag}\" \"${lan_ns}\" \"${bpf_filter}\" \"${CAPTURE_SNAPLEN:-96}\" \"${wifi_target}\""
+            "${SCRIPT_DIR}/capture.sh" start_dual "${tag}" "${lan_ns}" "${bpf_filter}" "${CAPTURE_SNAPLEN:-96}" "${wifi_target}" || true
+        fi
     fi
 
     # Execute the test function
     "$@"
 
-    if (( DRY_RUN == 0 && NO_CAPTURE == 0 )) && [[ -x "${SCRIPT_DIR}/capture.sh" ]]; then
-        log_cmd "${SCRIPT_DIR}/capture.sh stop"
-        "${SCRIPT_DIR}/capture.sh" stop || true
+    if (( DRY_RUN == 0 && NO_CAPTURE == 0 )); then
+        if declare -F capture_session_stop >/dev/null 2>&1; then
+            log_cmd "capture_session_stop"
+            capture_session_stop || true
+        elif [[ -x "${SCRIPT_DIR}/capture.sh" ]]; then
+            log_cmd "${SCRIPT_DIR}/capture.sh stop"
+            "${SCRIPT_DIR}/capture.sh" stop || true
+        fi
 
         # If user requested --merge-lan, execute post-merge cross-DUT evidence audit
-        if [[ "${MERGE_LAN:-0}" == "1" ]]; then
+        if [[ "${MERGE_LAN:-0}" == "1" ]] && [[ -x "${SCRIPT_DIR}/capture.sh" ]]; then
             "${SCRIPT_DIR}/capture.sh" merge-lan --audit ${DEEP_AUDIT:+--deep} || true
         fi
 
-        # If this was Wireless WMM QoS test and capture.sh stop did not already audit it, run fallback audit
+        # Invoke scenario-defined custom audit hook if registered
+        if declare -F "scenario_${tag}_audit" >/dev/null 2>&1; then
+            "scenario_${tag}_audit" || true
+        fi
+
+        # Unified Packet Evidence Audit from Capture Set Manifest
+        if [[ -f "${STATE_DIR}/latest_capture_set.json" ]] && [[ -f "${LAB_DIR}/tools/evidence_auditor.py" ]]; then
+            local -a ev_args=("python3" "${LAB_DIR}/tools/evidence_auditor.py" "--capture-set" "${STATE_DIR}/latest_capture_set.json")
+            if [[ -f "${STATE_DIR}/latest_wqos_context.json" ]]; then
+                ev_args+=("--context-json" "${STATE_DIR}/latest_wqos_context.json")
+            fi
+            ev_args+=("--output-json" "${LOG_DIR}/${tag}_evidence_audit.json")
+            log_cmd "${ev_args[*]}"
+            "${ev_args[@]}" || true
+        fi
+
+        # Legacy fallback audits (maintained for backwards compatibility)
         if [[ "${tag}" =~ (wireless_qos|wmm_qos|tc_wqos|wqos) ]] && [[ ! -f "${LOG_DIR}/wireless_qos_audit.json" ]] && [[ -x "${LAB_DIR}/tools/wireless_qos_audit.py" ]]; then
             local wan_cap lan_cap wifi_cap
             wan_cap="$(cat "${STATE_DIR}/latest_wan_pcap.txt" 2>/dev/null || true)"
